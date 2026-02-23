@@ -64,6 +64,8 @@ const DEFAULT_MULTIPLIER: u32 = 0x915f77f5;
 const DEFAULT_ADDEND: u32 = 0x34636463;
 const MIN_BUFFER_SIZE: usize = 1024 * 1024 * 4;
 
+pub mod recursive;
+
 pub(crate) mod scalar;
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
@@ -120,7 +122,7 @@ impl Cdc for MinCdc4 {
         if bytes.len() < 4 {
             return bytes.len();
         }
-        4 + simd::argmin_u32_overlapping_hashed::<false>(bytes, 1, 0)
+        4 + simd::argmin_u32_overlapping_hashed::<false>(bytes, 1, 0).0
     }
 }
 
@@ -169,7 +171,7 @@ impl Cdc for MinCdcHash4 {
         if bytes.len() < 4 {
             return bytes.len();
         }
-        4 + simd::argmin_u32_overlapping_hashed::<true>(bytes, self.multiplier, self.addend)
+        4 + simd::argmin_u32_overlapping_hashed::<true>(bytes, self.multiplier, self.addend).0
     }
 }
 

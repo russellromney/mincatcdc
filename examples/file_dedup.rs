@@ -12,14 +12,14 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::hash::BuildHasher;
-use std::io::{Result, Write};
+use std::io::{Read, Result, Write};
 
 use foldhash::quality::FixedState;
 use mincdc::{MinCdc4, MinCdcHash4, ReadChunker};
 
 fn chunk_file(
     digest_count: &mut HashMap<u64, usize>,
-    file: File,
+    mut file: File,
     alg: &str,
     min_chunk_size: usize,
     avg_chunk_size: usize,
@@ -40,6 +40,21 @@ fn chunk_file(
             let max_chunk_size = avg_chunk_size + avg_chunk_size - min_chunk_size;
             let mut chunker = ReadChunker::new(file, min_chunk_size, max_chunk_size, cdc);
             while let Some(chunk) = chunker.next()? {
+                let digest = FixedState::default().hash_one(&*chunk);
+                digest_count.insert(digest, chunk.len());
+            }
+        },
+        "recmincdchash4" => {
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf).unwrap();
+            let mut cdc = mincdc::recursive::SliceRecMinCdcHash4::new(
+                &buf,
+                min_chunk_size,
+                avg_chunk_size,
+                std::env::var("HORIZON").as_deref().unwrap_or("1000000").parse().unwrap()
+            );
+            let chunks = cdc.chunks();
+            for chunk in chunks {
                 let digest = FixedState::default().hash_one(&*chunk);
                 digest_count.insert(digest, chunk.len());
             }

@@ -25,6 +25,15 @@ fn chunk_slice(bytes: &[u8], alg: &str, min_chunk_size: usize, mean_chunk_size: 
                 std::hint::black_box(chunk[0]);
             }
         },
+        "recmincdchash4" => {
+            let mut chunker = mincdc::recursive::SliceRecMinCdcHash4::new(
+                &bytes,
+                min_chunk_size,
+                mean_chunk_size,
+                std::env::var("HORIZON").as_deref().unwrap_or("1000000").parse().unwrap()
+            );
+            std::hint::black_box(chunker.chunks());
+        },
         "fastcdc2020" => {
             // FastCDC wants assymmetric min/max sizes to not hit chunk limit too often.
             let max_chunk_size = mean_chunk_size + (mean_chunk_size - min_chunk_size) * 7;

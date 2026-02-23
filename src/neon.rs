@@ -4,7 +4,7 @@ pub fn argmin_u32_overlapping_hashed<const SHOULD_HASH: bool>(
     bytes: &[u8],
     multiplier: u32,
     addend: u32,
-) -> usize {
+) -> (usize, u32) {
     use std::arch::aarch64::*;
 
     assert!(bytes.len() < u32::MAX as usize);
@@ -15,7 +15,7 @@ pub fn argmin_u32_overlapping_hashed<const SHOULD_HASH: bool>(
 
     // Fast path for chunk starting with zeros (relatively common).
     if !SHOULD_HASH && bytes[0..4] == [0, 0, 0, 0] {
-        return 0;
+        return (0, 0);
     }
 
     unsafe {
@@ -79,11 +79,11 @@ pub fn argmin_u32_overlapping_hashed<const SHOULD_HASH: bool>(
             .unwrap();
         let min_offset_base = min_reg as u32 as usize;
 
-        let min_offset_inc = scalar::argmin_u32_overlapping_hashed_four::<SHOULD_HASH>(
+        let (min_offset_inc, min_val) = scalar::argmin_u32_overlapping_hashed_four::<SHOULD_HASH>(
             bytes.get_unchecked(min_offset_base..),
             multiplier,
             addend,
         );
-        min_offset_base + min_offset_inc
+        (min_offset_base + min_offset_inc, min_val)
     }
 }
