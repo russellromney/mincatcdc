@@ -11,13 +11,13 @@ by the data itself. This means duplicate regions in large (sets of) files are
 likely to have identical boundaries and can thus efficiently be found and
 deduplicated.
 
-To start using `mincdc` add the following to your `Cargo.toml`:
+To start using `mincatcdc` add the following to your `Cargo.toml`:
 
     [dependencies]
-    mincdc = "0.1"
+    mincatcdc = "0.2"
 
-Please refer to [the documentation](https://docs.rs/mincdc) for more information
-on usage. 
+Please refer to [the documentation](https://docs.rs/mincatcdc) for more
+information on usage.
 
 
 ## This fork: mincatcdc
