@@ -49,9 +49,9 @@ fn chunk_file(
             let max_chunk_size = avg_chunk_size + (avg_chunk_size - min_chunk_size) * 7;
             let mut chunker = fastcdc::v2020::StreamCDC::new(
                 file,
-                min_chunk_size as u32,
-                avg_chunk_size as u32,
-                max_chunk_size as u32,
+                min_chunk_size,
+                avg_chunk_size,
+                max_chunk_size,
             );
             while let Some(Ok(chunk)) = chunker.next() {
                 let digest = FixedState::default().hash_one(chunk.data);

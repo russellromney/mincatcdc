@@ -30,9 +30,9 @@ fn chunk_slice(bytes: &[u8], alg: &str, min_chunk_size: usize, mean_chunk_size: 
             let max_chunk_size = mean_chunk_size + (mean_chunk_size - min_chunk_size) * 7;
             let mut chunker = fastcdc::v2020::FastCDC::new(
                 bytes,
-                min_chunk_size as u32,
-                mean_chunk_size as u32,
-                max_chunk_size as u32,
+                min_chunk_size,
+                mean_chunk_size,
+                max_chunk_size,
             );
             while let Some(chunk) = chunker.next() {
                 std::hint::black_box(bytes[chunk.offset]);

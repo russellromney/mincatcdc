@@ -6,38 +6,68 @@
 //! record (e.g. one `extent_chunks` row), so a long zero-fill or repeated-record
 //! region costs metadata out of all proportion to its information content.
 //!
-//! This layer wraps a [`SliceChunker`] and run-length-encodes *maximal runs of
-//! byte-identical adjacent chunks* into a single [`Segment::Caterpillar`]. On a
-//! zero-fill / constant / exact-repeat region this collapses N records into one
-//! `(unit, count)` record. On generic data it is a no-op (adjacent chunks differ,
-//! every segment is a [`Segment::Solo`]) and adds ~one slice comparison per chunk.
+//! This layer wraps a [`SliceChunker`] and coalesces such regions in two tiers:
 //!
-//! ## What it catches and what it does not
-//! mincdc places a boundary at the minimizing window in `[min, max]`. On periodic
-//! data of period `P`, consecutive chunks have a *constant phase shift* equal to
-//! `chunk_len % P`. When that is `0` (zero-fill `P=1`, constant bytes, or a period
-//! that divides the chunk length) the chunks are byte-identical and coalesce
-//! perfectly. When the phase rotates (`chunk_len % P != 0`) the chunks are
-//! rotations of the same period, *not* byte-equal, so this simple
-//! content-equality RLE does **not** coalesce them — a period-detecting variant
-//! would. The tests below measure exactly where the line falls.
+//!  - **Tier 1 (always on, free):** run-length-encode maximal runs of
+//!    byte-identical adjacent chunks into a [`Segment::Caterpillar`]. Catches
+//!    zero-fill, constant bytes, and exact repeats whose period divides the
+//!    chunk length. One slice compare per chunk; a no-op on generic data.
+//!
+//!  - **Tier 2 (gated fallback):** when tier 1 does not fire, cheaply probe the
+//!    chunk for a repeating period `P` (the prefix-recurrence gate below). If the
+//!    chunk is `P`-periodic, extend the run over following chunks while the
+//!    period holds and emit a [`Segment::Periodic`]. This catches the
+//!    *phase-rotating* case — periodic data where `chunk_len % P != 0`, so
+//!    consecutive chunks are rotations of the same period and tier 1 cannot see
+//!    them as equal.
+//!
+//! ## Keeping tier 2 honest
+//!  - **Gate:** the period probe scans for the recurrence of the chunk's 16-byte
+//!    prefix. On random data the prefix does not recur, so it rejects after a
+//!    bounded scan (capped at [`MAX_PERIOD`]); false positives are ~`2^-64`.
+//!  - **Budget:** a byte budget bounds total detection work so adversarial
+//!    "near-periodic" input cannot drag throughput down to the probe's speed.
+//!  - **Dedup identity:** the stored period cell is canonicalized to its least
+//!    rotation (Booth's algorithm) so the *same* periodic content deduplicates
+//!    regardless of the phase at which the run happened to start. The Chonkers
+//!    paper flags this exact shift-dependence hazard.
 
 use crate::{Cdc, Chunk, SliceChunker};
+
+/// Largest period (bytes) tier-2 detection will look for. Bounds the gate scan
+/// and keeps the common (random) path cheap.
+pub const MAX_PERIOD: usize = 4096;
+
+/// Length of the prefix used by the period-recurrence gate.
+const PROBE: usize = 16;
 
 /// One output unit of [`CaterpillarChunker`].
 #[derive(Debug)]
 pub enum Segment<'a> {
     /// A single chunk whose neighbor differed — emitted as-is.
     Solo(Chunk<'a>),
-    /// A maximal run of `count` (>= 2) byte-identical adjacent chunks, stored as
-    /// the repeated `unit` plus the repeat `count`.
+    /// A run of `count` (>= 2) byte-identical adjacent chunks (tier 1).
     Caterpillar {
         /// Start offset of the run within the input.
         offset: usize,
-        /// The repeated chunk's bytes (one period of the run).
+        /// The repeated chunk's bytes.
         unit: &'a [u8],
         /// Number of times `unit` repeats (>= 2).
         count: usize,
+    },
+    /// A `P`-periodic region spanning `chunks` (>= 2) underlying chunks (tier 2).
+    /// Reconstructed by tiling `raw_period` across `total_len` bytes.
+    Periodic {
+        /// Start offset of the run within the input.
+        offset: usize,
+        /// The period as it appears at `offset` (length `P`).
+        raw_period: &'a [u8],
+        /// Total bytes covered (may not be a whole multiple of `P`).
+        total_len: usize,
+        /// Underlying chunk count represented.
+        chunks: usize,
+        /// Least rotation of `raw_period` — the phase-independent dedup identity.
+        canonical: Vec<u8>,
     },
 }
 
@@ -46,7 +76,7 @@ impl<'a> Segment<'a> {
     pub fn offset(&self) -> usize {
         match self {
             Segment::Solo(c) => c.offset(),
-            Segment::Caterpillar { offset, .. } => *offset,
+            Segment::Caterpillar { offset, .. } | Segment::Periodic { offset, .. } => *offset,
         }
     }
 
@@ -55,6 +85,7 @@ impl<'a> Segment<'a> {
         match self {
             Segment::Solo(_) => 1,
             Segment::Caterpillar { count, .. } => *count,
+            Segment::Periodic { chunks, .. } => *chunks,
         }
     }
 
@@ -63,6 +94,7 @@ impl<'a> Segment<'a> {
         match self {
             Segment::Solo(c) => c.len(),
             Segment::Caterpillar { unit, count, .. } => unit.len() * count,
+            Segment::Periodic { total_len, .. } => *total_len,
         }
     }
 
@@ -72,23 +104,97 @@ impl<'a> Segment<'a> {
     }
 }
 
-/// Wraps a [`SliceChunker`] and run-length-encodes runs of byte-identical
-/// adjacent chunks into [`Segment::Caterpillar`]s.
+/// Wraps a [`SliceChunker`] and coalesces periodic / repeated regions.
 pub struct CaterpillarChunker<'a, C> {
     data: &'a [u8],
     inner: SliceChunker<'a, C>,
-    /// A chunk already pulled from `inner` that belongs to the next run.
     carry: Option<Chunk<'a>>,
+    enable_period: bool,
+    period_budget: usize,
 }
 
 impl<'a, C: Cdc> CaterpillarChunker<'a, C> {
-    /// Creates a new caterpillar-coalescing chunker over `bytes`.
+    /// Full caterpillar: tier 1 + tier 2 period detection, unbounded budget.
     pub fn new(bytes: &'a [u8], min_size: usize, max_size: usize, cdc: C) -> Self {
+        Self::configured(bytes, min_size, max_size, cdc, true, usize::MAX)
+    }
+
+    /// Tier 1 only (byte-identical RLE) — the simple caterpillar, for comparison.
+    pub fn simple(bytes: &'a [u8], min_size: usize, max_size: usize, cdc: C) -> Self {
+        Self::configured(bytes, min_size, max_size, cdc, false, 0)
+    }
+
+    /// Full caterpillar with an explicit detection byte budget (floors the
+    /// adversarial worst case).
+    pub fn with_budget(
+        bytes: &'a [u8],
+        min_size: usize,
+        max_size: usize,
+        cdc: C,
+        period_budget: usize,
+    ) -> Self {
+        Self::configured(bytes, min_size, max_size, cdc, true, period_budget)
+    }
+
+    fn configured(
+        bytes: &'a [u8],
+        min_size: usize,
+        max_size: usize,
+        cdc: C,
+        enable_period: bool,
+        period_budget: usize,
+    ) -> Self {
         Self {
             data: bytes,
             inner: SliceChunker::new(bytes, min_size, max_size, cdc),
             carry: None,
+            enable_period,
+            period_budget,
         }
+    }
+
+    /// Tier-2 gate + detector. Returns the smallest detected period `P` of the
+    /// chunk `[start, end)`, or `None`. Charges the byte budget.
+    fn detect_period(&mut self, start: usize, end: usize) -> Option<usize> {
+        let len = end - start;
+        if len < 2 * PROBE || self.period_budget < len {
+            return None;
+        }
+        self.period_budget -= len;
+
+        let data = self.data;
+        let prefix = &data[start..start + PROBE];
+        let max_p = (len / 2).min(MAX_PERIOD);
+
+        let mut p = 1;
+        while p <= max_p {
+            // Cheap first-byte gate, then full prefix compare on a hit.
+            if data[start + p] == prefix[0] && &data[start + p..start + p + PROBE] == prefix {
+                // Verify the whole chunk is p-periodic: data[i] == data[i - p].
+                if data[start + p..end]
+                    .iter()
+                    .zip(&data[start..end - p])
+                    .all(|(a, b)| a == b)
+                {
+                    return Some(p);
+                }
+            }
+            p += 1;
+        }
+        None
+    }
+
+    /// Does `[cstart, cend)` continue a `P`-periodic run (already periodic before
+    /// `cstart`)? Checks `data[i] == data[i - P]`.
+    fn continues_period(&self, cstart: usize, cend: usize, p: usize) -> bool {
+        if cstart < p {
+            return false;
+        }
+        let data = self.data;
+        data[cstart..cend]
+            .iter()
+            .zip(&data[cstart - p..cend - p])
+            .all(|(a, b)| a == b)
     }
 }
 
@@ -96,31 +202,104 @@ impl<'a, C: Cdc> Iterator for CaterpillarChunker<'a, C> {
     type Item = Segment<'a>;
 
     fn next(&mut self) -> Option<Segment<'a>> {
-        // Start the run with a carried chunk, or pull a fresh one.
         let first = self.carry.take().or_else(|| self.inner.next())?;
-        let offset = first.offset();
-        // Re-slice the backing data so `unit` carries the full 'a lifetime
-        // (Chunk's Deref only yields a borrow tied to `first`).
-        let unit: &'a [u8] = &self.data[offset..offset + first.len()];
+        let start = first.offset();
+        let first_len = first.len();
+        let unit: &'a [u8] = &self.data[start..start + first_len];
 
+        // Tier 1: coalesce byte-identical adjacent chunks.
         let mut count = 1usize;
-        loop {
+        let pending: Option<Chunk<'a>> = loop {
             match self.inner.next() {
                 Some(c) if &*c == unit => count += 1,
-                Some(c) => {
-                    self.carry = Some(c);
-                    break;
+                other => break other,
+            }
+        };
+        if count >= 2 {
+            self.carry = pending;
+            return Some(Segment::Caterpillar { offset: start, unit, count });
+        }
+
+        // Tier 2: gated period detection on the single chunk `first`.
+        if self.enable_period {
+            if let Some(p) = self.detect_period(start, start + first_len) {
+                let mut run_end = start + first_len;
+                let mut chunks = 1usize;
+                let mut nextc = pending;
+                loop {
+                    match nextc {
+                        Some(c) if self.continues_period(c.offset(), c.offset() + c.len(), p) => {
+                            run_end = c.offset() + c.len();
+                            chunks += 1;
+                            nextc = self.inner.next();
+                        }
+                        other => {
+                            self.carry = other;
+                            break;
+                        }
+                    }
                 }
-                None => break,
+                if chunks >= 2 {
+                    let raw_period = &self.data[start..start + p];
+                    let canonical = canonical_rotation(raw_period);
+                    return Some(Segment::Periodic {
+                        offset: start,
+                        raw_period,
+                        total_len: run_end - start,
+                        chunks,
+                        canonical,
+                    });
+                }
+                // Detected a period but it did not extend: not worth a record.
+                // `self.carry` was already set in the loop.
+                return Some(Segment::Solo(first));
             }
         }
 
-        if count == 1 {
-            Some(Segment::Solo(first))
+        self.carry = pending;
+        Some(Segment::Solo(first))
+    }
+}
+
+/// Returns the least rotation of `s` (Booth's algorithm, O(n)). Used to give a
+/// periodic cell a phase-independent dedup identity.
+fn canonical_rotation(s: &[u8]) -> Vec<u8> {
+    let k = least_rotation(s);
+    let mut out = Vec::with_capacity(s.len());
+    out.extend_from_slice(&s[k..]);
+    out.extend_from_slice(&s[..k]);
+    out
+}
+
+/// Booth's algorithm: index of the lexicographically least rotation of `s`.
+fn least_rotation(s: &[u8]) -> usize {
+    let n = s.len();
+    if n == 0 {
+        return 0;
+    }
+    let idx = |x: isize| -> u8 { s[x.rem_euclid(n as isize) as usize] };
+    let mut f = vec![-1isize; 2 * n];
+    let mut k: isize = 0;
+    for j in 1..(2 * n) as isize {
+        let sj = idx(j);
+        let mut i = f[(j - k - 1) as usize];
+        while i != -1 && sj != idx(k + i + 1) {
+            if sj < idx(k + i + 1) {
+                k = j - i - 1;
+            }
+            i = f[i as usize];
+        }
+        if sj != idx(k + i + 1) {
+            // i == -1 here
+            if sj < idx(k + i + 1) {
+                k = j;
+            }
+            f[(j - k) as usize] = -1;
         } else {
-            Some(Segment::Caterpillar { offset, unit, count })
+            f[(j - k) as usize] = i + 1;
         }
     }
+    k as usize
 }
 
 #[cfg(test)]
@@ -130,42 +309,6 @@ mod tests {
 
     const MIN: usize = 2 * 1024;
     const MAX: usize = 14 * 1024;
-
-    /// Returns (plain_chunks, caterpillar_segments, expanded_chunks) and asserts
-    /// the caterpillar output preserves coverage and reconstructs the input.
-    fn measure(label: &str, data: &[u8]) -> (usize, usize, usize) {
-        let cdc = MinCdcHash4::new();
-        let plain = SliceChunker::new(data, MIN, MAX, cdc).count();
-
-        let mut segs = 0usize;
-        let mut expanded = 0usize;
-        let mut next_off = 0usize;
-        let mut rebuilt: Vec<u8> = Vec::with_capacity(data.len());
-        for s in CaterpillarChunker::new(data, MIN, MAX, cdc) {
-            assert_eq!(s.offset(), next_off, "{label}: segment offset not contiguous");
-            segs += 1;
-            expanded += s.chunk_count();
-            match &s {
-                Segment::Solo(c) => rebuilt.extend_from_slice(c),
-                Segment::Caterpillar { unit, count, .. } => {
-                    for _ in 0..*count {
-                        rebuilt.extend_from_slice(unit);
-                    }
-                }
-            }
-            next_off += s.len();
-        }
-        assert_eq!(rebuilt, data, "{label}: caterpillar must reconstruct input exactly");
-        assert_eq!(expanded, plain, "{label}: must represent the same underlying chunks");
-
-        let reduction = if plain > 0 {
-            100.0 * (1.0 - segs as f64 / plain as f64)
-        } else {
-            0.0
-        };
-        println!("{label:<26} plain={plain:>5}  caterpillar={segs:>5}  records -{reduction:>5.1}%");
-        (plain, segs, expanded)
-    }
 
     fn xorshift(seed: u64, n: usize) -> Vec<u8> {
         let mut s = seed | 1;
@@ -179,54 +322,154 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn caterpillar_wins_on_low_entropy() {
-        // Zero-fill (period 1): every chunk is identical -> collapses to ~1 record.
-        let (plain, segs, _) = measure("zero-fill 1MiB", &vec![0u8; 1024 * 1024]);
-        assert!(segs * 10 < plain, "zero-fill should collapse drastically");
+    /// Drives a chunker, asserts exact reconstruction + same underlying chunk
+    /// count, and returns (plain_chunks, caterpillar_records).
+    fn measure(label: &str, data: &[u8], full: bool) -> (usize, usize) {
+        measure_mm(label, data, full, MIN, MAX)
+    }
 
-        // Constant non-zero byte: same story.
-        let (plain, segs, _) = measure("const 0xAB 1MiB", &vec![0xABu8; 1024 * 1024]);
-        assert!(segs * 10 < plain);
+    fn measure_mm(label: &str, data: &[u8], full: bool, min: usize, max: usize) -> (usize, usize) {
+        let cdc = MinCdcHash4::new();
+        let plain = SliceChunker::new(data, min, max, cdc).count();
 
-        // Exact-repeat of a small unit (period divides nicely for some lengths).
-        let unit = xorshift(7, 512);
-        let mut repeated = Vec::new();
-        for _ in 0..2000 {
-            repeated.extend_from_slice(&unit);
+        let chunker = if full {
+            CaterpillarChunker::new(data, min, max, cdc)
+        } else {
+            CaterpillarChunker::simple(data, min, max, cdc)
+        };
+
+        let mut records = 0usize;
+        let mut expanded = 0usize;
+        let mut next_off = 0usize;
+        let mut rebuilt: Vec<u8> = Vec::with_capacity(data.len());
+        for s in chunker {
+            assert_eq!(s.offset(), next_off, "{label}: offset not contiguous");
+            records += 1;
+            expanded += s.chunk_count();
+            match &s {
+                Segment::Solo(c) => rebuilt.extend_from_slice(c),
+                Segment::Caterpillar { unit, count, .. } => {
+                    for _ in 0..*count {
+                        rebuilt.extend_from_slice(unit);
+                    }
+                }
+                Segment::Periodic { raw_period, total_len, .. } => {
+                    let mut written = 0;
+                    while written < *total_len {
+                        let take = raw_period.len().min(*total_len - written);
+                        rebuilt.extend_from_slice(&raw_period[..take]);
+                        written += take;
+                    }
+                }
+            }
+            next_off += s.len();
         }
-        measure("repeat 512B x2000", &repeated);
+        assert_eq!(rebuilt, data, "{label}: must reconstruct input exactly");
+        assert_eq!(expanded, plain, "{label}: must represent same chunk count");
 
-        // Long zero-run embedded in random data.
-        let mut mixed = xorshift(99, 1024 * 1024);
-        for b in mixed.iter_mut().take(768 * 1024).skip(256 * 1024) {
-            *b = 0;
-        }
-        measure("random+zero-run", &mixed);
+        let pct = if plain > 0 {
+            100.0 * (1.0 - records as f64 / plain as f64)
+        } else {
+            0.0
+        };
+        let tier = if full { "full " } else { "simple" };
+        println!("{label:<24} {tier}  plain={plain:>5}  records={records:>5}  -{pct:>5.1}%");
+        (plain, records)
     }
 
     #[test]
-    fn caterpillar_is_noop_on_random() {
-        // On incompressible data, adjacent chunks differ: segments ~= plain chunks,
-        // so the layer is essentially free and never hurts.
+    fn booth_least_rotation_is_correct() {
+        // Brute-force oracle for small inputs.
+        fn brute(s: &[u8]) -> Vec<u8> {
+            (0..s.len())
+                .map(|k| {
+                    let mut r = s[k..].to_vec();
+                    r.extend_from_slice(&s[..k]);
+                    r
+                })
+                .min()
+                .unwrap_or_default()
+        }
+        for seed in 0..200u64 {
+            let n = 1 + (seed as usize % 17);
+            let s = xorshift(seed + 1, n);
+            assert_eq!(canonical_rotation(&s), brute(&s), "seed {seed}");
+        }
+        assert_eq!(canonical_rotation(b"bca"), b"abc");
+        assert_eq!(canonical_rotation(b"abcabc"), b"abcabc");
+    }
+
+    #[test]
+    fn tier1_already_handles_period_aligned_data() {
+        // FINDING: mincdc self-aligns boundaries to periods when a period multiple
+        // fits in [min, max] (here chunk_len ~= 3 * 777), so consecutive chunks are
+        // byte-identical and tier 1 alone collapses the region. Tier 2 adds little.
+        let period = xorshift(42, 777);
+        let mut data = Vec::new();
+        while data.len() < 4 * 1024 * 1024 {
+            data.extend_from_slice(&period);
+        }
+        let (plain, simple) = measure("period777 wide [2k,14k]", &data, false);
+        let (_, full) = measure("period777 wide [2k,14k]", &data, true);
+        assert!(simple * 20 < plain, "tier 1 already collapses aligned periodic data");
+        assert!(full <= simple, "tier 2 must never be worse than tier 1");
+    }
+
+    #[test]
+    fn tier2_wins_when_no_period_multiple_fits() {
+        // Force genuine rotation: with [2048, 2200] there is NO multiple of 777 in
+        // range, so mincdc cannot align -> every chunk is a different rotation ->
+        // tier 1 fails. Tier 2's period detection still collapses it.
+        let period = xorshift(42, 777);
+        let mut data = Vec::new();
+        while data.len() < 4 * 1024 * 1024 {
+            data.extend_from_slice(&period);
+        }
+        let (plain, simple) = measure_mm("period777 narrow [2k,2.2k]", &data, false, 2048, 2200);
+        let (_, full) = measure_mm("period777 narrow [2k,2.2k]", &data, true, 2048, 2200);
+
+        assert!(simple as f64 > plain as f64 * 0.9, "tier 1 cannot coalesce rotations");
+        assert!(full * 20 < plain, "tier 2 collapses the rotating run");
+    }
+
+    #[test]
+    fn full_still_wins_on_low_entropy_and_is_noop_on_random() {
+        // Zero-fill: tier 1 already nails it; tier 2 must not regress it.
+        let (plain, records) = measure("zero-fill 1MiB", &vec![0u8; 1024 * 1024], true);
+        assert!(records * 10 < plain);
+
+        // Random: no coalescing in either tier; layer is ~free and lossless.
         let data = xorshift(1234, 1024 * 1024);
-        let (plain, segs, _) = measure("random 1MiB", &data);
+        let (plain, records) = measure("random 1MiB", &data, true);
         assert!(
-            segs as f64 >= plain as f64 * 0.98,
-            "should not coalesce meaningfully on random data"
+            records as f64 >= plain as f64 * 0.98,
+            "must not coalesce random data"
         );
     }
 
     #[test]
-    fn phase_rotating_period_limitation() {
-        // A period that does NOT divide the chunk length: chunks are rotations of
-        // the same period, not byte-equal, so content-equality RLE can't coalesce.
-        // Documents the limitation honestly (a period-detecting variant would win).
-        let period: Vec<u8> = (0..777u32).map(|i| (i % 251) as u8).collect();
+    fn budget_floors_detection_work() {
+        // With a zero budget, the full chunker degrades to tier 1 only.
+        let period = xorshift(7, 999);
         let mut data = Vec::new();
         while data.len() < 1024 * 1024 {
             data.extend_from_slice(&period);
         }
-        measure("phase-rotating period", &data);
+        let cdc = MinCdcHash4::new();
+        let plain = SliceChunker::new(&data, MIN, MAX, cdc).count();
+
+        // Narrow window so tier 1 cannot align: tier 2 is the only thing that can
+        // collapse it, and only when the budget allows detection.
+        let (min, max) = (2048usize, 2200usize);
+        let plain_narrow = SliceChunker::new(&data, min, max, cdc).count();
+        let starved = CaterpillarChunker::with_budget(&data, min, max, cdc, 0).count();
+        let fed = CaterpillarChunker::with_budget(&data, min, max, cdc, usize::MAX).count();
+
+        assert!(
+            starved as f64 > plain_narrow as f64 * 0.9,
+            "budget 0 disables period detection"
+        );
+        assert!(fed * 20 < starved, "budget enables the collapse");
+        println!("budget: plain={plain} narrow_plain={plain_narrow} starved={starved} fed={fed}");
     }
 }
