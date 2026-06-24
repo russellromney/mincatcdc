@@ -15,6 +15,38 @@ Please refer to [the documentation](https://docs.rs/mincdc) for more information
 on usage. 
 
 
+## This fork: mincatcdc
+
+This is a fork of [orlp/mincdc](https://github.com/orlp/mincdc) that adds one
+thing on top: a **caterpillar** layer.
+
+**The problem it fixes.** Like any content-defined chunker, mincdc turns a long
+run of identical bytes — zeros, padding, a repeated block — into a flood of tiny
+chunks. Each chunk is a metadata record (a fingerprint, an index entry). The
+data dedupes to almost nothing, but you still pay to track all those records. A
+mostly-empty 200 MiB disk image, for example, becomes ~182,000 records.
+
+**What the caterpillar does.** It is a small, lossless pass over the chunk stream
+that collapses any run of byte-identical adjacent chunks into a single record
+with a repeat count. On that disk image: **182,701 → 7,798 records (−96%)**, with
+no change to what is stored and no preprocessing required. On normal data it does
+nothing and costs nothing (it is a no-op when there are no runs), so it keeps
+mincdc's speed and deduplication everywhere else.
+
+**Lineage.** The idea comes from the [Chonkers
+algorithm](https://arxiv.org/abs/2509.11121) (Berger, 2025), which calls a
+periodic run a *caterpillar*. We borrowed just that one practical idea and put it
+on top of mincdc rather than adopting the whole (heavier) Chonkers machinery.
+
+**Why it's nice.** It's a drop-in wrapper that gives you metadata-efficient CDC
+on redundant data without writing any domain-specific preprocessing (zero
+detection, sparse reads, etc.). See `examples/CATBENCH_RESULTS.md` and
+`examples/REALBENCH_RESULTS.md` for measurements on real corpora.
+
+This fork also fixes a soundness bug in the upstream SIMD prefetch and adds test
+coverage (cross-SIMD-width determinism, an invariant/oracle harness).
+
+
 ## Algorithm
 
 The basic idea of MinCDC is to choose chunk boundaries based on the minimum
