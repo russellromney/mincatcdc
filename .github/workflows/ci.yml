@@ -29,3 +29,18 @@ jobs:
         run: cargo build --all-targets
       - name: test
         run: cargo test --release
+
+  # Run the cross-SIMD-width determinism test under Intel SDE so the AVX-512
+  # argmin path actually executes (and is checked against the scalar oracle) even
+  # though GitHub runners may lack AVX-512 hardware.
+  avx512:
+    name: avx512 (SDE emulation)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: petarpetrovt/setup-sde@v2.4
+      - name: Build tests
+        run: cargo test --release --no-run
+      - name: cross-impl determinism under emulated AVX-512 (Sapphire Rapids)
+        run: ${SDE_PATH}/sde64 -spr -- cargo test --release test_simd_widths_agree_with_scalar -- --nocapture

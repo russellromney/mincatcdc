@@ -11,8 +11,9 @@
 //! variant once returned a rotated key and silently corrupted off-phase runs).
 
 use std::collections::HashMap;
+use std::io::Cursor;
 
-use mincatcdc::{CaterpillarChunker, MinCdcHash4, SliceChunker};
+use mincatcdc::{CaterpillarChunker, CaterpillarReadChunker, MinCdcHash4, SliceChunker};
 use proptest::prelude::*;
 
 fn fnv1a(b: &[u8]) -> u64 {
@@ -151,6 +152,39 @@ fn roundtrip_offphase_periodic_with_detection() {
         data.extend_from_slice(&period);
     }
     assert_roundtrip("offphase-period", &data, 2048, 2200, Some(usize::MAX));
+}
+
+#[test]
+fn streaming_caterpillar_matches_slice_and_roundtrips() {
+    // The streaming (bounded-memory) caterpillar must produce exactly the same
+    // segments as the in-memory tier-1 caterpillar, and round-trip losslessly.
+    for (name, data) in corpora() {
+        for (min, max) in [(2048usize, 14336usize), (2048, 2200), (64, 256)] {
+            let cdc = MinCdcHash4::new();
+            // In-memory tier-1: (offset, dedup_key bytes, chunk_count).
+            let slice: Vec<(usize, Vec<u8>, usize)> = CaterpillarChunker::new(&data, min, max, cdc)
+                .map(|s| (s.offset(), s.dedup_key().to_vec(), s.chunk_count()))
+                .collect();
+
+            // Streaming over a reader, and reconstruct from the owned segments.
+            let mut rc = CaterpillarReadChunker::new(Cursor::new(&data), min, max, cdc);
+            let mut stream = Vec::new();
+            let mut rebuilt = Vec::with_capacity(data.len());
+            while let Some(s) = rc.next().unwrap() {
+                stream.push((s.offset(), s.dedup_key().to_vec(), s.chunk_count()));
+                s.reconstruct_into(&mut rebuilt);
+            }
+
+            assert_eq!(
+                slice, stream,
+                "{name} (min={min} max={max}): stream != slice"
+            );
+            assert_eq!(
+                rebuilt, data,
+                "{name} (min={min} max={max}): stream round-trip corrupt"
+            );
+        }
+    }
 }
 
 proptest! {

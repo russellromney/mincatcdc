@@ -12,7 +12,7 @@ fn chunk_slice(bytes: &[u8], alg: &str, min_chunk_size: usize, mean_chunk_size: 
             #[allow(deprecated)]
             let cdc = MinCdc4::new();
             let max_chunk_size = mean_chunk_size + mean_chunk_size - min_chunk_size;
-            let mut chunker = SliceChunker::new(bytes, min_chunk_size, max_chunk_size, cdc);
+            let chunker = SliceChunker::new(bytes, min_chunk_size, max_chunk_size, cdc);
             for chunk in chunker {
                 std::hint::black_box(chunk[0]);
             }
@@ -20,7 +20,7 @@ fn chunk_slice(bytes: &[u8], alg: &str, min_chunk_size: usize, mean_chunk_size: 
         "mincdchash4" => {
             let cdc = MinCdcHash4::new();
             let max_chunk_size = mean_chunk_size + mean_chunk_size - min_chunk_size;
-            let mut chunker = SliceChunker::new(bytes, min_chunk_size, max_chunk_size, cdc);
+            let chunker = SliceChunker::new(bytes, min_chunk_size, max_chunk_size, cdc);
             for chunk in chunker {
                 std::hint::black_box(chunk[0]);
             }
@@ -28,7 +28,7 @@ fn chunk_slice(bytes: &[u8], alg: &str, min_chunk_size: usize, mean_chunk_size: 
         "fastcdc2020" => {
             // FastCDC wants assymmetric min/max sizes to not hit chunk limit too often.
             let max_chunk_size = mean_chunk_size + (mean_chunk_size - min_chunk_size) * 7;
-            let mut chunker = fastcdc::v2020::FastCDC::new(
+            let chunker = fastcdc::v2020::FastCDC::new(
                 bytes,
                 min_chunk_size,
                 mean_chunk_size,
