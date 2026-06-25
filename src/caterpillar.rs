@@ -255,36 +255,36 @@ impl<'a, C: Cdc> Iterator for CaterpillarChunker<'a, C> {
         }
 
         // Tier 2: gated period detection on the single chunk `first`.
-        if self.enable_period {
-            if let Some(p) = self.detect_period(start, start + first_len) {
-                let mut run_end = start + first_len;
-                let mut chunks = 1usize;
-                let mut nextc = pending;
-                loop {
-                    match nextc {
-                        Some(c) if self.continues_period(c.offset(), c.offset() + c.len(), p) => {
-                            run_end = c.offset() + c.len();
-                            chunks += 1;
-                            nextc = self.inner.next();
-                        },
-                        other => {
-                            self.carry = other;
-                            break;
-                        },
-                    }
+        if self.enable_period
+            && let Some(p) = self.detect_period(start, start + first_len)
+        {
+            let mut run_end = start + first_len;
+            let mut chunks = 1usize;
+            let mut nextc = pending;
+            loop {
+                match nextc {
+                    Some(c) if self.continues_period(c.offset(), c.offset() + c.len(), p) => {
+                        run_end = c.offset() + c.len();
+                        chunks += 1;
+                        nextc = self.inner.next();
+                    },
+                    other => {
+                        self.carry = other;
+                        break;
+                    },
                 }
-                if chunks >= 2 {
-                    return Some(Segment::Periodic {
-                        offset: start,
-                        raw_period: &self.data[start..start + p],
-                        total_len: run_end - start,
-                        chunks,
-                    });
-                }
-                // Detected a period but it did not extend: not worth a record.
-                // `self.carry` was already set in the loop.
-                return Some(Segment::Solo(first));
             }
+            if chunks >= 2 {
+                return Some(Segment::Periodic {
+                    offset: start,
+                    raw_period: &self.data[start..start + p],
+                    total_len: run_end - start,
+                    chunks,
+                });
+            }
+            // Detected a period but it did not extend: not worth a record.
+            // `self.carry` was already set in the loop.
+            return Some(Segment::Solo(first));
         }
 
         self.carry = pending;
