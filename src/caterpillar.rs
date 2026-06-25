@@ -48,13 +48,19 @@ use std::io::{self, Read};
 use crate::{Cdc, Chunk, SliceChunker};
 
 /// Largest period (bytes) tier-2 detection will look for. Bounds the gate scan
-/// and keeps the common (random) path cheap.
-pub const MAX_PERIOD: usize = 4096;
+/// and keeps the common (random) path cheap. Internal tuning constant.
+pub(crate) const MAX_PERIOD: usize = 4096;
 
 /// Length of the prefix used by the period-recurrence gate.
 const PROBE: usize = 16;
 
-/// One output unit of [`CaterpillarChunker`].
+/// One output unit of [`CaterpillarChunker`] or [`CaterpillarReadChunker`].
+///
+/// The borrow source differs by producer: from [`CaterpillarChunker`] a segment
+/// borrows the input slice (valid for the whole iteration); from
+/// [`CaterpillarReadChunker`] it borrows the reader's reused buffer and is valid
+/// **only until the next call**. Process it (or copy [`dedup_key`](Self::dedup_key))
+/// before advancing the streaming chunker.
 #[derive(Debug)]
 pub enum Segment<'a> {
     /// A single chunk whose neighbor differed — emitted as-is.
@@ -397,6 +403,9 @@ impl<R: Read, C: Cdc> CaterpillarReadChunker<R, C> {
     }
 
     /// Gets the next [`Segment`] (borrowed, valid until the next call), or `None`.
+    ///
+    /// Like [`ReadChunker`](crate::ReadChunker), a `read` returning `Ok(0)` is
+    /// treated as end of input.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> io::Result<Option<Segment<'_>>> {
         if self.done {

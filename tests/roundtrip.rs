@@ -13,7 +13,9 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 
-use mincatcdc::{CaterpillarChunker, CaterpillarReadChunker, MinCdcHash4, SliceChunker};
+use mincatcdc::{
+    CaterpillarChunker, CaterpillarReadChunker, MinCdcHash4, ReadChunker, Segment, SliceChunker,
+};
 use proptest::prelude::*;
 
 fn fnv1a(b: &[u8]) -> u64 {
@@ -200,6 +202,50 @@ fn assert_stream_roundtrip<R: std::io::Read>(
         chunks, plain,
         "{tag}: chunk_count {chunks} != plain {plain}"
     );
+}
+
+#[test]
+fn streaming_chunk_boundaries_match_plain_mincdc() {
+    // Proves the streaming caterpillar uses the SAME content-defined chunk
+    // boundaries as plain ReadChunker — so cross-machine dedup is equivalent,
+    // not merely lossless. This also guards against the boundary-decision logic
+    // (replicated in chunk_len) silently diverging from the core chunkers.
+    for (name, data) in corpora() {
+        for (min, max) in [(2048usize, 14336usize), (2048, 2200), (64, 256)] {
+            let cdc = MinCdcHash4::new();
+
+            let mut plain = Vec::new();
+            let mut rc = ReadChunker::new(Cursor::new(&data), min, max, cdc);
+            while let Some(c) = rc.next().unwrap() {
+                plain.push((c.offset(), c.len()));
+            }
+
+            // Expand the streaming caterpillar's segments back to per-chunk
+            // boundaries; they must match plain mincdc exactly.
+            let mut expanded = Vec::new();
+            let mut sc = CaterpillarReadChunker::new(Cursor::new(&data), min, max, cdc);
+            while let Some(s) = sc.next().unwrap() {
+                match s {
+                    Segment::Solo(c) => expanded.push((c.offset(), c.len())),
+                    Segment::Caterpillar {
+                        offset,
+                        unit,
+                        count,
+                    } => {
+                        for i in 0..count {
+                            expanded.push((offset + i * unit.len(), unit.len()));
+                        }
+                    },
+                    Segment::Periodic { .. } => unreachable!("streaming path is tier-1 only"),
+                }
+            }
+
+            assert_eq!(
+                plain, expanded,
+                "{name} (min={min} max={max}): boundaries differ"
+            );
+        }
+    }
 }
 
 #[test]
