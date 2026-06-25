@@ -32,9 +32,8 @@
 //! *phase-rotating* periodic runs (consecutive chunks that are rotations of the
 //! same period, which the default cannot see as equal). It is usually not worth
 //! it — it adds a large per-chunk cost and mincdc already self-aligns to most
-//! periods — so it is opt-in. The detected period cell is canonicalized to its
-//! least rotation (Booth's algorithm) so the same periodic content dedups
-//! regardless of phase. See `examples/CATBENCH_RESULTS.md`.
+//! periods — so it is opt-in. It still round-trips losslessly (each periodic run
+//! stores its period at the run's own phase). See `examples/CATBENCH_RESULTS.md`.
 
 use crate::{Cdc, Chunk, SliceChunker};
 
@@ -60,18 +59,19 @@ pub enum Segment<'a> {
         count: usize,
     },
     /// A `P`-periodic region spanning `chunks` (>= 2) underlying chunks (tier 2).
-    /// Reconstructed by tiling `raw_period` across `total_len` bytes.
+    /// Reconstructed by tiling `raw_period` across `total_len` bytes — which is
+    /// exactly what [`dedup_key`](Self::dedup_key) returns, so the dedup
+    /// round-trip is lossless.
     Periodic {
         /// Start offset of the run within the input.
         offset: usize,
-        /// The period as it appears at `offset` (length `P`).
+        /// The period at this run's phase (length `P`). Tiling it across
+        /// `total_len` reproduces the region exactly.
         raw_period: &'a [u8],
         /// Total bytes covered (may not be a whole multiple of `P`).
         total_len: usize,
         /// Underlying chunk count represented.
         chunks: usize,
-        /// Least rotation of `raw_period` — the phase-independent dedup identity.
-        canonical: Vec<u8>,
     },
 }
 
@@ -107,16 +107,36 @@ impl<'a> Segment<'a> {
         self.len() == 0
     }
 
-    /// The unique content to fingerprint/store for content addressing: the chunk
-    /// bytes for [`Segment::Solo`], the repeated unit for [`Segment::Caterpillar`],
-    /// or the canonical (phase-independent) period for [`Segment::Periodic`].
-    /// Hash this; store it once; use [`offset`](Self::offset),
-    /// [`len`](Self::len), and [`chunk_count`](Self::chunk_count) for the record.
+    /// The unique content to fingerprint and store for content addressing: the
+    /// chunk bytes ([`Segment::Solo`]), the repeated unit ([`Segment::Caterpillar`]),
+    /// or the period ([`Segment::Periodic`]).
+    ///
+    /// This is also exactly the bytes to tile back to [`len`](Self::len) to
+    /// reconstruct the segment, so a store-then-restore round-trip is lossless
+    /// for every variant: hash and store `dedup_key()`, record
+    /// [`offset`](Self::offset) and [`len`](Self::len), and on restore tile the
+    /// stored bytes to `len`. See [`reconstruct_into`](Self::reconstruct_into).
     pub fn dedup_key(&self) -> &[u8] {
         match self {
-            Segment::Solo(c) => &**c,
+            Segment::Solo(c) => c,
             Segment::Caterpillar { unit, .. } => unit,
-            Segment::Periodic { canonical, .. } => canonical,
+            Segment::Periodic { raw_period, .. } => raw_period,
+        }
+    }
+
+    /// Appends this segment's original bytes to `out` (the inverse of chunking):
+    /// the chunk for [`Segment::Solo`], the unit repeated for
+    /// [`Segment::Caterpillar`], or the period tiled to `total_len` for
+    /// [`Segment::Periodic`]. Equivalent to tiling [`dedup_key`](Self::dedup_key)
+    /// to [`len`](Self::len).
+    pub fn reconstruct_into(&self, out: &mut Vec<u8>) {
+        let key = self.dedup_key();
+        let total = self.len();
+        let mut written = 0;
+        while written < total {
+            let take = key.len().min(total - written);
+            out.extend_from_slice(&key[..take]);
+            written += take;
         }
     }
 }
@@ -247,14 +267,11 @@ impl<'a, C: Cdc> Iterator for CaterpillarChunker<'a, C> {
                     }
                 }
                 if chunks >= 2 {
-                    let raw_period = &self.data[start..start + p];
-                    let canonical = canonical_rotation(raw_period);
                     return Some(Segment::Periodic {
                         offset: start,
-                        raw_period,
+                        raw_period: &self.data[start..start + p],
                         total_len: run_end - start,
                         chunks,
-                        canonical,
                     });
                 }
                 // Detected a period but it did not extend: not worth a record.
@@ -266,47 +283,6 @@ impl<'a, C: Cdc> Iterator for CaterpillarChunker<'a, C> {
         self.carry = pending;
         Some(Segment::Solo(first))
     }
-}
-
-/// Returns the least rotation of `s` (Booth's algorithm, O(n)). Used to give a
-/// periodic cell a phase-independent dedup identity.
-fn canonical_rotation(s: &[u8]) -> Vec<u8> {
-    let k = least_rotation(s);
-    let mut out = Vec::with_capacity(s.len());
-    out.extend_from_slice(&s[k..]);
-    out.extend_from_slice(&s[..k]);
-    out
-}
-
-/// Booth's algorithm: index of the lexicographically least rotation of `s`.
-fn least_rotation(s: &[u8]) -> usize {
-    let n = s.len();
-    if n == 0 {
-        return 0;
-    }
-    let idx = |x: isize| -> u8 { s[x.rem_euclid(n as isize) as usize] };
-    let mut f = vec![-1isize; 2 * n];
-    let mut k: isize = 0;
-    for j in 1..(2 * n) as isize {
-        let sj = idx(j);
-        let mut i = f[(j - k - 1) as usize];
-        while i != -1 && sj != idx(k + i + 1) {
-            if sj < idx(k + i + 1) {
-                k = j - i - 1;
-            }
-            i = f[i as usize];
-        }
-        if sj != idx(k + i + 1) {
-            // i == -1 here
-            if sj < idx(k + i + 1) {
-                k = j;
-            }
-            f[(j - k) as usize] = -1;
-        } else {
-            f[(j - k) as usize] = i + 1;
-        }
-    }
-    k as usize
 }
 
 #[cfg(test)]
@@ -382,28 +358,6 @@ mod tests {
         let tier = if full { "full " } else { "simple" };
         println!("{label:<24} {tier}  plain={plain:>5}  records={records:>5}  -{pct:>5.1}%");
         (plain, records)
-    }
-
-    #[test]
-    fn booth_least_rotation_is_correct() {
-        // Brute-force oracle for small inputs.
-        fn brute(s: &[u8]) -> Vec<u8> {
-            (0..s.len())
-                .map(|k| {
-                    let mut r = s[k..].to_vec();
-                    r.extend_from_slice(&s[..k]);
-                    r
-                })
-                .min()
-                .unwrap_or_default()
-        }
-        for seed in 0..200u64 {
-            let n = 1 + (seed as usize % 17);
-            let s = xorshift(seed + 1, n);
-            assert_eq!(canonical_rotation(&s), brute(&s), "seed {seed}");
-        }
-        assert_eq!(canonical_rotation(b"bca"), b"abc");
-        assert_eq!(canonical_rotation(b"abcabc"), b"abcabc");
     }
 
     #[test]

@@ -18,7 +18,7 @@
 use std::time::Instant;
 
 use fastcdc::v2020::FastCDC;
-use mincatcdc::caterpillar::{CaterpillarChunker, Segment};
+use mincatcdc::caterpillar::CaterpillarChunker;
 use mincatcdc::{MinCdcHash4, SliceChunker};
 
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -149,13 +149,7 @@ fn run_caterpillar(data: &[u8], min: usize, max: usize, full: bool, d: &mut Dedu
         make(full).map(|s| std::hint::black_box(s.offset())).count()
     });
     for s in make(full) {
-        match s {
-            Segment::Solo(c) => d.add(fnv1a(&c), c.len(), c.len()),
-            Segment::Caterpillar { unit, count, .. } => d.add(fnv1a(unit), unit.len(), unit.len() * count),
-            Segment::Periodic { canonical, total_len, .. } => {
-                d.add(fnv1a(&canonical), canonical.len(), total_len)
-            }
-        }
+        d.add(fnv1a(s.dedup_key()), s.dedup_key().len(), s.len());
     }
     Stats { records, logical: data.len(), gbps }
 }
@@ -208,11 +202,7 @@ fn scenario_versioned(min: usize, avg: usize, max: usize) {
     let mut d = Dedup::new();
     for data in [&v1[..], &v2[..]] {
         for s in CaterpillarChunker::new(data, min, max, cdc).with_period_detection(usize::MAX) {
-            match s {
-                Segment::Solo(c) => d.add(fnv1a(&c), c.len(), c.len()),
-                Segment::Caterpillar { unit, count, .. } => d.add(fnv1a(unit), unit.len(), unit.len() * count),
-                Segment::Periodic { canonical, total_len, .. } => d.add(fnv1a(&canonical), canonical.len(), total_len),
-            }
+            d.add(fnv1a(s.dedup_key()), s.dedup_key().len(), s.len());
         }
     }
     println!("  {:<18} records={:>7}  uniq={:>7}  dedup={:>5.1}%", "mincdc+cat-period", d.records, d.unique(), d.dedup_pct());

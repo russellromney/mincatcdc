@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use fastcdc::v2020::FastCDC;
-use mincatcdc::caterpillar::{CaterpillarChunker, Segment};
+use mincatcdc::caterpillar::CaterpillarChunker;
 use mincatcdc::{MinCdcHash4, SliceChunker};
 
 const MIN: usize = 2048;
@@ -184,15 +184,7 @@ fn main() {
                 CaterpillarChunker::new(b, MIN, MC_MAX, cdc)
             };
             for s in it {
-                match s {
-                    Segment::Solo(c) => a.add(fnv1a(&c), c.len(), c.len()),
-                    Segment::Caterpillar { unit, count, .. } => {
-                        a.add(fnv1a(unit), unit.len(), unit.len() * count)
-                    }
-                    Segment::Periodic { canonical, total_len, .. } => {
-                        a.add(fnv1a(&canonical), canonical.len(), total_len)
-                    }
-                }
+                a.add(fnv1a(s.dedup_key()), s.dedup_key().len(), s.len());
             }
         }
         a.report(label, total_bytes);

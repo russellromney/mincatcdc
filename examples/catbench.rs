@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use mincatcdc::caterpillar::{CaterpillarChunker, Segment};
+use mincatcdc::caterpillar::CaterpillarChunker;
 use mincatcdc::{MinCdcHash4, SliceChunker};
 
 const MIN: usize = 2048;
@@ -122,12 +122,7 @@ fn main() {
                         CaterpillarChunker::new(b, MIN, MAX, cdc)
                     };
                     for s in it {
-                        let k = match s {
-                            Segment::Solo(c) => fnv(&c),
-                            Segment::Caterpillar { unit, .. } => fnv(unit),
-                            Segment::Periodic { ref canonical, .. } => fnv(canonical),
-                        };
-                        seen.insert(k, ());
+                        seen.insert(fnv(s.dedup_key()), ());
                         rec += 1;
                     }
                 }
