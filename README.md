@@ -41,6 +41,17 @@ The caterpillar idea comes from the [Chonkers
 algorithm](https://arxiv.org/abs/2509.11121) (Berger, 2025), which calls a
 periodic run a *caterpillar*.
 
+For head-to-head numbers against other chunkers (FastCDC, AE, RAM, SeqCDC,
+VectorCDC-accelerated variants, …) measured by the *same* harness, this crate
+plugs into [UWASL dedup-bench](https://github.com/UWASL/dedup-bench) via a C
+API: see the
+[mincatcdc-integration fork](https://github.com/russellromney/dedup-bench/tree/mincatcdc-integration)
+(`chunking_algo=mincdc`, built against `cargo build --release --features capi`).
+The corpus used for the numbers in `CHANGELOG.md` is public — VM images plus a
+sha256 manifest at
+`https://mincatcdc-bench-corpus.t3.storage.dev/corpus/MANIFEST.sha256` — so
+the comparison is reproducible end to end.
+
 On speed, the caterpillar is free on data with no runs (within ~2%) and much
 *faster* than plain mincdc on redundant data: a packed SIMD scan (in the spirit
 of VectorCDC, FAST '25) proves a run periodic once and emits the repeated

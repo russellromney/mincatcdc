@@ -28,12 +28,33 @@ Packed-scanning caterpillar fast path (VectorCDC-style SIMD).
     within ~2%.
   - Synthetic ceiling: zeros 2.4 → 74.3 GiB/s on Intel Xeon/AVX-512BW,
     1.8 → 30.2 GiB/s on NEON.
-- Context vs UWASL dedup-bench (VectorCDC, FAST'25) on the same raw VM image,
-  same machine (EPYC/AVX2), chunking-only, ~8.5 KiB avg chunks: FastCDC
-  1.8 GiB/s, AE-Min 1.3 GiB/s, VectorCDC-AE-Min 14.1 GiB/s, VectorCDC-RAM
-  25.2 GiB/s, mincatcdc packed 13.0 GiB/s — comparable to VectorCDC-AE-Min
-  while additionally emitting caterpillar-coalesced metadata. On the DEB .ova
-  files plain mincdc (12 GiB/s) is ~2.4x VectorCDC-AE-Min (4.9 GiB/s).
+- New `capi` feature: a minimal C API (`mincatcdc_next_chunk`) plus a
+  dedup-bench fork
+  (github.com/russellromney/dedup-bench, branch `mincatcdc-integration`)
+  that adds `chunking_algo=mincdc`, so mincatcdc is measured by the *same*
+  harness, timers, and dedup measurement as every other chunker. A unit test
+  drives the C API under dedup-bench's exact buffering protocol and asserts
+  boundary equality with `SliceChunker`; hash outputs of plain and
+  caterpillar modes are byte-identical by construction (verified on NEON and
+  x64).
+- Head-to-head in dedup-bench itself (one AMD EPYC/AVX2 machine, chunking
+  only, ~8 KiB targets). Raw Debian VM image: mincdc 4.8 GiB/s,
+  mincdc+caterpillar 10.1 GiB/s — vs AE-Min 1.3, FastCDC 1.8, SeqCDC 2.7,
+  VectorCDC-AE-Max 9.3, VectorCDC-AE-Min 14.7, VectorCDC-RAM 24.3. DEB .ova
+  subset (FAST'25 dataset, compressed VMDKs): mincdc 11.6 GiB/s — faster
+  than every content-defined competitor except VectorCDC-RAM (21.3);
+  caterpillar neutral (-0.5%).
+- The metrics that matter beyond speed, same runs: **space savings** — mincdc
+  has the best dedup ratio of all algorithms measured on both datasets
+  (raw image 53.19% vs FastCDC 51.77% / AE-Min 50.02%; DEB subset 8.14% vs
+  FastCDC 7.88% / AE-Min 6.16%), and the caterpillar preserves it exactly.
+  **Metadata records** — on the raw image the caterpillar collapses 231,777
+  chunks into 56,536 records (-76%, 10.6 -> 2.6 MiB), fewer records than
+  AE-Min (97k), RAM (77k), or SeqCDC (71k) emit as plain chunks; on run-free
+  data record count is unchanged.
+- The benchmark corpus (raw Debian image + 3 DEB .ova files + sha256
+  manifest) is public:
+  https://mincatcdc-bench-corpus.t3.storage.dev/corpus/MANIFEST.sha256
 - Tests: a `packed_repeats` soundness test against the real boundary search as
   oracle (break position swept over every byte at every alignment), a
   segment-stream differential against the pre-SIMD caterpillar (adversarial
