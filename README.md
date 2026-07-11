@@ -41,12 +41,17 @@ The caterpillar idea comes from the [Chonkers
 algorithm](https://arxiv.org/abs/2509.11121) (Berger, 2025), which calls a
 periodic run a *caterpillar*.
 
-On speed, the caterpillar is free on data with no runs and much *faster* than
-plain mincdc on redundant data: a packed SIMD scan (in the spirit of VectorCDC,
-FAST '25) proves a run periodic once and emits the repeated chunks without
-re-running the boundary search — ~15x on zero-fill and ~13x on periodic data in
-`cargo bench` (NEON; SSE2/AVX2/AVX-512 selected at runtime on x86_64). And
-mincdc is already several times faster than FastCDC.
+On speed, the caterpillar is free on data with no runs (within ~2%) and much
+*faster* than plain mincdc on redundant data: a packed SIMD scan (in the spirit
+of VectorCDC, FAST '25) proves a run periodic once and emits the repeated
+chunks without re-running the boundary search. On a raw Debian VM image that is
+2.6–3.8x plain mincdc (13.0 GiB/s on AMD EPYC/AVX2, 11.2 GiB/s on Apple
+M-series/NEON); on a mostly-empty disk image ~17x; on compressed or run-free
+data (`.ova` appliances, SQLite, logs) it changes nothing. Zero-fill is the
+ceiling: ~30x (74 GiB/s on AVX-512). See `CHANGELOG.md` for the full tables and
+`benches/throughput.rs` (`cargo bench`, no RUSTFLAGS needed — SIMD width is
+runtime-detected; `BENCH_CORPUS=<dir>` benches your own files). And mincdc is
+already several times faster than FastCDC.
 
 The output: metadata-efficient CDC
 on redundant data without writing any domain-specific preprocessing (zero

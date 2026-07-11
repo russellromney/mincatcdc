@@ -16,15 +16,24 @@ Packed-scanning caterpillar fast path (VectorCDC-style SIMD).
   word-at-a-time scalar fallback.
 - Applies to both `CaterpillarChunker` and `CaterpillarReadChunker`. Output is
   bit-identical to 0.5.0 (same segments, same grouping, same bytes).
-- Criterion bench (`cargo bench`, min=2048 max=14336), caterpillar 0.5 → 0.6:
-  - Apple M-series (NEON): zeros 1.78 → 30.2 GiB/s, periodic-777 2.03 → 27.5
-    GiB/s, random+zero-hole 2.96 → 13.3 GiB/s, random unchanged (~8.3 GiB/s).
-  - Intel Xeon w/ AVX-512BW (dedicated Fly performance-4x): zeros 2.41 → 74.3
-    GiB/s, periodic-777 2.54 → 22.9 GiB/s, random+zero-hole 3.51 → 13.8 GiB/s,
-    random unchanged (~10.2 GiB/s).
-
-  The caterpillar previously cost up to ~8% on redundant data; it is now
-  9–30x faster than plain mincdc there.
+- Bench results (`cargo bench`, min=2048 max=14336), caterpillar 0.5 → 0.6.
+  Real data first — synthetic pure-zeros is the ceiling, not the claim:
+  - Raw Debian 12 VM image (uncompressed, first 768 MiB): 5.0 → 13.0 GiB/s
+    (2.6x) on AMD EPYC/AVX2; 3.0 → 11.2 GiB/s (3.8x) on Apple M-series/NEON.
+  - Mostly-empty 200 MiB disk image: 1.8 → 30.9 GiB/s (17x, NEON).
+  - Zero-padded build artifact: 5.0 → 8.1 GiB/s (1.6x, NEON).
+  - FAST'25 DEB dataset (.ova appliances — streamOptimized/compressed VMDKs,
+    so no byte-identical runs exist): no change, ~12 GiB/s all variants on
+    EPYC/AVX2. Compressed or run-free data (SQLite, logs, random) is a no-op
+    within ~2%.
+  - Synthetic ceiling: zeros 2.4 → 74.3 GiB/s on Intel Xeon/AVX-512BW,
+    1.8 → 30.2 GiB/s on NEON.
+- Context vs UWASL dedup-bench (VectorCDC, FAST'25) on the same raw VM image,
+  same machine (EPYC/AVX2), chunking-only, ~8.5 KiB avg chunks: FastCDC
+  1.8 GiB/s, AE-Min 1.3 GiB/s, VectorCDC-AE-Min 14.1 GiB/s, VectorCDC-RAM
+  25.2 GiB/s, mincatcdc packed 13.0 GiB/s — comparable to VectorCDC-AE-Min
+  while additionally emitting caterpillar-coalesced metadata. On the DEB .ova
+  files plain mincdc (12 GiB/s) is ~2.4x VectorCDC-AE-Min (4.9 GiB/s).
 - Tests: a `packed_repeats` soundness test against the real boundary search as
   oracle (break position swept over every byte at every alignment), a
   segment-stream differential against the pre-SIMD caterpillar (adversarial
