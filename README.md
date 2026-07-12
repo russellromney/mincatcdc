@@ -2,7 +2,7 @@
 
 > A fork of [MinCDC](https://github.com/orlp/mincdc) that adds a *caterpillar*
 > layer for metadata-efficient content-defined chunking on redundant data. The
-> algorithm described below is MinCDC; see [This fork](#this-fork-mincatcdc) for
+> algorithm described below is MinCDC; see [This fork](#this-fork-mothcdc) for
 > what's added and why.
 
 MinCDC is a very simple yet efficient content-defined chunking algorithm. It
@@ -11,16 +11,16 @@ by the data itself. This means duplicate regions in large (sets of) files are
 likely to have identical boundaries and can thus efficiently be found and
 deduplicated.
 
-To start using `mincatcdc` add the following to your `Cargo.toml`:
+To start using `mothcdc` add the following to your `Cargo.toml`:
 
     [dependencies]
     mothcdc = "0.6"
 
-Please refer to [the documentation](https://docs.rs/mincatcdc) for more
+Please refer to [the documentation](https://docs.rs/mothcdc) for more
 information on usage.
 
 
-## This fork: mincatcdc
+## This fork: mothcdc
 
 MinCDC — the algorithm and its SIMD core — is Orson Peters' work. This fork
 adds a *caterpillar* layer, an idea from the
