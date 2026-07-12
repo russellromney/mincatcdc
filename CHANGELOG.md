@@ -23,6 +23,19 @@ blend design is correct). Hash multiplier choice: measured irrelevant
 (three multipliers within noise); `a=0` trades +1.4pp savings for chunk-size
 skew and -15% speed — documented, not defaulted.
 
+Backup-generation corpus (LNX: 6 consecutive linux-6.6.x source tars, 8 GB,
+dedup-bench harness) — added because VM images are not the typical dedup
+workload — found and fixed a real caterpillar regression: tars of similar
+trees are full of medium pseudo-periodic stretches where the unbounded
+extent scan ran long and yielded nothing (-31% vs plain mincdc). The scan
+is now staged behind a one-unit probe (bounded like the pre-0.6 memcmp),
+shrinking the overhead to ~5% on that corpus, with identical output.
+LNX results: mincdc dedup 59.17% and the narrow (4096,12288) config 60.28%
+— the best space savings of every algorithm measured (SeqCDC 56.45%,
+AE-Min 55.47%, FastCDC 52.44%, RAM 49.21%) — at 8.3-9.9 GB/s vs
+VectorCDC-AE-Min's 4.6 GB/s on the same data (only VectorCDC-RAM is
+faster at 17.2 GB/s, with the worst dedup of the field).
+
 ## 0.6.0 — 2026-07-10
 
 Packed-scanning caterpillar fast path (VectorCDC-style SIMD).
