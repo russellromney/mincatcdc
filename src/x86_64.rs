@@ -287,16 +287,38 @@ pub fn argmin_u32_overlapping_hashed<const SHOULD_HASH: bool>(
     multiplier: u32,
     addend: u32,
 ) -> usize {
-    const MIN_SIMD_LEN: usize = 16 + 3;
-    assert!(bytes.len() <= u32::MAX as usize);
-
-    let within_four_offset = if SHOULD_HASH {
-        unsafe { ARGMIN_HASH_IMPL(bytes, multiplier, addend) }
+    let implementation = if SHOULD_HASH {
+        *ARGMIN_HASH_IMPL
     } else {
-        unsafe { ARGMIN_IMPL(bytes, multiplier, addend) }
+        *ARGMIN_IMPL
     };
+    argmin_with_impl::<SHOULD_HASH>(bytes, multiplier, addend, implementation)
+}
 
-    if bytes.len() >= MIN_SIMD_LEN {
+#[inline(always)]
+fn argmin_with_impl<const SHOULD_HASH: bool>(
+    bytes: &[u8],
+    multiplier: u32,
+    addend: u32,
+    implementation: ArgMinFn,
+) -> usize {
+    assert!(bytes.len() <= u32::MAX as usize);
+    let within_four_offset = unsafe { implementation(bytes, multiplier, addend) };
+    refine_argmin::<SHOULD_HASH>(bytes, within_four_offset, multiplier, addend)
+}
+
+#[inline(always)]
+fn refine_argmin<const SHOULD_HASH: bool>(
+    bytes: &[u8],
+    within_four_offset: usize,
+    multiplier: u32,
+    addend: u32,
+) -> usize {
+    // SIMD implementations return the start of a four-position block and
+    // therefore always leave the seven bytes needed by the exact refinement.
+    // The scalar runtime-dispatch fallback already returns the exact argmin,
+    // which may be one of the final three windows. Do not refine that result.
+    if bytes.len() >= 16 + 3 && bytes.len() - within_four_offset >= 7 {
         let final_bump = scalar::argmin_u32_overlapping_hashed_four::<SHOULD_HASH>(
             &bytes[within_four_offset..],
             multiplier,
@@ -565,6 +587,27 @@ mod tests {
     use rand::distr::StandardUniform;
     use rand::prelude::*;
 
+    #[test]
+    fn scalar_dispatch_result_at_tail_needs_no_refinement() {
+        let mut bytes = vec![0xFF; 19];
+        bytes[15..].fill(0);
+
+        let got =
+            argmin_with_impl::<false>(&bytes, 1, 0, scalar::argmin_u32_overlapping_hashed::<false>);
+        assert_eq!(got, 15);
+
+        let multiplier = 0x9E37_79B1;
+        let addend = 0x85EB_CA77;
+        let exact = scalar::argmin_u32_overlapping_hashed::<true>(&bytes, multiplier, addend);
+        let got = argmin_with_impl::<true>(
+            &bytes,
+            multiplier,
+            addend,
+            scalar::argmin_u32_overlapping_hashed::<true>,
+        );
+        assert_eq!(got, exact);
+    }
+
     // Reconstruct the full argmin from a "within-four" SIMD result, mirroring
     // the dispatch logic in argmin_u32_overlapping_hashed. The *_impl functions
     // only locate the block containing the global minimizer within the next four
@@ -572,19 +615,9 @@ mod tests {
     // bump, so the test must do the same before comparing to the scalar oracle.
     macro_rules! full_from_impl {
         ($within_four:expr, $hash:literal, $mul:expr, $add:expr, $bytes:expr) => {{
-            const MIN_SIMD_LEN: usize = 16 + 3;
             let bytes: &[u8] = $bytes;
             let within_four = $within_four;
-            if bytes.len() >= MIN_SIMD_LEN {
-                within_four
-                    + scalar::argmin_u32_overlapping_hashed_four::<$hash>(
-                        &bytes[within_four..],
-                        $mul,
-                        $add,
-                    )
-            } else {
-                within_four
-            }
+            refine_argmin::<$hash>(bytes, within_four, $mul, $add)
         }};
     }
 

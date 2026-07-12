@@ -47,7 +47,7 @@ fn run(label: &str, blobs: &[Vec<u8>], total: u64, min: usize, max: usize, cdc: 
     let mut best = f64::MAX;
     for _ in 0..3 {
         let t = Instant::now();
-        let mut acc = 0usize;
+        let mut acc = 0u64;
         for b in blobs {
             for s in MothChunker::with_cdc(b, min, max, cdc) {
                 acc ^= s.offset();
@@ -59,7 +59,7 @@ fn run(label: &str, blobs: &[Vec<u8>], total: u64, min: usize, max: usize, cdc: 
 
     // Dedup + metadata (single deterministic pass).
     let mut store: HashMap<u64, usize> = HashMap::new();
-    let (mut records, mut chunks) = (0usize, 0usize);
+    let (mut records, mut chunks) = (0usize, 0u64);
     for b in blobs {
         for s in MothChunker::with_cdc(b, min, max, cdc) {
             let key = s.dedup_key();

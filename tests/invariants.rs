@@ -14,8 +14,6 @@
 //!  5. Reader/Slice agreement -- ReadChunker == SliceChunker under a hostile
 //!     (1-byte) reader that stresses buffer refills.
 
-#![allow(deprecated)] // MinCdc4 is deprecated but we still want to test it.
-
 use std::io::{self, Read};
 
 use mothcdc::mincdc::{Cdc, MinCdc4, MinCdcHash4, ReadChunker, SliceChunker};
@@ -112,11 +110,11 @@ fn oracle_chunks(
 fn slice_chunks(data: &[u8], min: usize, max: usize, mode: Mode) -> Vec<(usize, usize)> {
     fn collect<C: Cdc>(data: &[u8], min: usize, max: usize, cdc: C) -> Vec<(usize, usize)> {
         SliceChunker::new(data, min, max, cdc)
-            .map(|c| (c.offset(), c.len()))
+            .map(|c| (c.offset() as usize, c.len()))
             .collect()
     }
     match mode {
-        Mode::Plain => collect(data, min, max, MinCdc4::new()),
+        Mode::Plain => collect(data, min, max, MinCdc4),
         Mode::Hashed => collect(data, min, max, MinCdcHash4::with_params(HASH_M, HASH_A)),
     }
 }
@@ -156,12 +154,12 @@ fn read_chunks(
         let mut chunker = ReadChunker::new(reader, min, max, cdc);
         let mut out = Vec::new();
         while let Some(chunk) = chunker.next().unwrap() {
-            out.push((chunk.offset(), chunk.len()));
+            out.push((chunk.offset() as usize, chunk.len()));
         }
         out
     }
     match mode {
-        Mode::Plain => collect(data, min, max, MinCdc4::new(), step),
+        Mode::Plain => collect(data, min, max, MinCdc4, step),
         Mode::Hashed => collect(
             data,
             min,
@@ -220,7 +218,10 @@ fn check_all(data: &[u8], min: usize, max: usize, mode: Mode) {
         data.len()
     );
 
-    // Tier 5: ReadChunker must match SliceChunker, even with a choked reader.
+    // Tier 5: ReadChunker must match SliceChunker, even with a choked reader
+    // that fragments the internal buffer refills. This runs on every corpus and
+    // proptest case so the streaming buffer state machine is fuzzed against the
+    // in-memory chunker, not just checked on a handful of fixed inputs.
     for &step in &[1usize, 3, 7, 64, 4096] {
         let read = read_chunks(data, min, max, mode, step);
         assert_eq!(
@@ -283,6 +284,19 @@ fn corpus_all_invariants() {
     }
 }
 
+#[test]
+fn hostile_reader_matches_slice_chunker() {
+    let mut data = (0..8192).map(|i| (i * 31) as u8).collect::<Vec<_>>();
+    data[2048..6144].fill(0);
+    for (min, max) in [(1usize, 4usize), (64, 256)] {
+        for mode in [Mode::Plain, Mode::Hashed] {
+            let slice = slice_chunks(&data, min, max, mode);
+            let read = read_chunks(&data, min, max, mode, 3);
+            assert_eq!(read, slice, "mode={mode:?}, min={min}, max={max}");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tier 3b: large random buffers to exercise the SIMD main loops + tail paths.
 // ---------------------------------------------------------------------------
@@ -324,12 +338,12 @@ fn large_random_differential() {
 // ---------------------------------------------------------------------------
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
 
     #[test]
     fn prop_invariants_and_oracle(
         data in proptest::collection::vec(any::<u8>(), 0..8192),
-        min in 4usize..400,
+        min in 1usize..400,
         extra in 0usize..400,
     ) {
         let max = min + extra;

@@ -166,7 +166,7 @@ fn caterpillar_scalar_reference(data: &[u8]) -> usize {
             Some((off, len)) if data[off..off + len] == c[..] => {},
             _ => {
                 records += 1;
-                last = Some((c.offset(), c.len()));
+                last = Some((c.offset() as usize, c.len()));
             },
         }
     }
@@ -184,7 +184,7 @@ fn bench_chunking(c: &mut Criterion) {
 
         g.bench_with_input(BenchmarkId::new("plain", &name), &data, |b, d| {
             b.iter(|| {
-                let mut acc = 0usize;
+                let mut acc = 0u64;
                 for c in SliceChunker::new(d, MIN, MAX, MinCdcHash4::new()) {
                     acc ^= c.offset();
                 }
@@ -203,7 +203,7 @@ fn bench_chunking(c: &mut Criterion) {
             &data,
             |b, d| {
                 b.iter(|| {
-                    let mut acc = 0usize;
+                    let mut acc = 0u64;
                     for s in MothChunker::new(d, MIN, MAX) {
                         acc ^= s.offset() ^ s.chunk_count();
                     }

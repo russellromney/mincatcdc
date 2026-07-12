@@ -1,7 +1,7 @@
 [package]
 name = "mothcdc"
-version = "0.7.0"
-authors = ["Orson Peters <orsonpeters@gmail.com>", "Russell Romney"]
+version = "0.7.1"
+authors = ["Russell Romney"]
 license = "Zlib"
 repository = "https://github.com/russellromney/mothcdc"
 readme = "README.md"
@@ -13,11 +13,6 @@ edition = "2024"
 # (the crate does not build on x86 below that). Other targets only need 1.85.
 rust-version = "1.89"
 exclude = ["assets", "tools"]
-
-[lib]
-# staticlib is consumed by the dedup-bench integration (feature `capi`);
-# rlib is the normal Rust library.
-crate-type = ["rlib", "staticlib"]
 
 [features]
 # Minimal C API for embedding in external harnesses (see src/capi.rs).

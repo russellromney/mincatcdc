@@ -68,11 +68,11 @@ impl Acc {
             secs: 0.0,
         }
     }
-    fn add(&mut self, key: u64, stored: usize, logical: usize) {
+    fn add(&mut self, key: u64, stored: usize, logical: u64) {
         self.seen.entry(key).or_insert(stored);
         self.records += 1;
-        self.logical += logical as u64;
-        self.sizes.push(logical as u32);
+        self.logical += logical;
+        self.sizes.push(u32::try_from(logical).unwrap_or(u32::MAX));
     }
     fn report(&self, name: &str, total_bytes: u64) {
         let gbps = total_bytes as f64 / self.secs.max(1e-9) / 1e9;
@@ -147,7 +147,7 @@ fn main() {
     for b in &blobs {
         for c in FastCDC::new(b, MIN, AVG, fast_max()) {
             let s = &b[c.offset..c.offset + c.length];
-            a.add(fnv1a(s), s.len(), s.len());
+            a.add(fnv1a(s), s.len(), s.len() as u64);
         }
     }
     a.report("fastcdc-v2020", total_bytes);
@@ -155,7 +155,7 @@ fn main() {
     // mincdc-plain
     let mut a = Acc::new();
     let t = Instant::now();
-    let mut sink = 0usize;
+    let mut sink = 0u64;
     for b in &blobs {
         for c in SliceChunker::new(b, MIN, MC_MAX, cdc) {
             sink ^= c.offset();
@@ -165,7 +165,7 @@ fn main() {
     std::hint::black_box(sink);
     for b in &blobs {
         for c in SliceChunker::new(b, MIN, MC_MAX, cdc) {
-            a.add(fnv1a(&c), c.len(), c.len());
+            a.add(fnv1a(&c), c.len(), c.len() as u64);
         }
     }
     a.report("mincdc-plain", total_bytes);
@@ -174,7 +174,7 @@ fn main() {
     {
         let mut a = Acc::new();
         let t = Instant::now();
-        let mut sink = 0usize;
+        let mut sink = 0u64;
         for b in &blobs {
             for s in MothChunker::with_cdc(b, MIN, MC_MAX, cdc) {
                 sink ^= s.offset();
