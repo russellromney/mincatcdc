@@ -1,4 +1,4 @@
-# mincatcdc
+# MothCDC
 
 > A fork of [MinCDC](https://github.com/orlp/mincdc) that adds a *caterpillar*
 > layer for metadata-efficient content-defined chunking on redundant data. The
@@ -41,19 +41,19 @@ data with no runs. When streaming, runs survive buffer refills, so a multi-GB
 zero region is still one record.
 
 The crate also ships a C API (`--features capi`) and a
-[dedup-bench fork](https://github.com/russellromney/dedup-bench/tree/mincatcdc-integration)
+[dedup-bench fork](https://github.com/russellromney/dedup-bench/tree/MothCDC-integration)
 so it can be measured by the same harness as every other chunker.
 
 ### Benchmarks
 
 All numbers come from [UWASL dedup-bench](https://github.com/UWASL/dedup-bench)
-(the VectorCDC evaluation harness), with mincatcdc plugged in as a chunking
+(the VectorCDC evaluation harness), with MothCDC plugged in as a chunking
 technique — same loop, same timers, same dedup measurement as every other
 algorithm. One AMD EPYC/AVX2 machine, one session, ~8 KiB target chunks.
 Corpora: a raw Debian VM image (768 MiB), DEB `.ova` appliances (3 GiB, FAST
 '25 dataset), six consecutive linux-6.6.x source tars (8 GiB, stand-ins for
 backup generations), and enwik9 (1 GiB of Wikipedia text, never used for
-tuning). mincatcdc uses the recommended window `(min=4096, max=12288)`; the
+tuning). MothCDC uses the recommended window `(min=4096, max=12288)`; the
 "wide" row is `(2048, 14336)`.
 
 Throughput, GiB/s:
@@ -63,16 +63,16 @@ Throughput, GiB/s:
 | AE-Min / FastCDC / RAM | 1.4 / 1.8 / 1.5 | 1.4 / 2.0 / 1.4 | 1.4 / 1.9 / 1.6 | 1.4 / 1.9 / 1.9 |
 | SeqCDC | 3.2 | 6.4 | 7.1 | 5.9 |
 | VectorCDC AE-Min (AVX2) | 14.0 | 5.4 | 7.9 | 8.5 |
-| mincatcdc (wide) | 11.4 | 10.7 | 9.3 | 8.0 |
-| **mincatcdc** | **16.2** | **15.2** | **14.0** | **13.1** |
+| MothCDC (wide) | 11.4 | 10.7 | 9.3 | 8.0 |
+| **MothCDC** | **16.2** | **15.2** | **14.0** | **13.1** |
 | VectorCDC RAM (AVX2) | 23.4 | 19.6 | 24.7 | 29.6 |
 
 Space savings (dedup-bench `measure-dedup`; same result on any machine):
 
 | algorithm | raw VM | DEB .ova | LNX |
 |---|---|---|---|
-| **mincatcdc** | **53.3%** | **5.2%** | **60.3%** |
-| mincatcdc (wide) | 53.2% | 4.9% | 59.2% |
+| **MothCDC** | **53.3%** | **5.2%** | **60.3%** |
+| MothCDC (wide) | 53.2% | 4.9% | 59.2% |
 | SeqCDC | 52.4% | 4.0% | 56.5% |
 | FastCDC | 51.8% | 4.8% | 52.4% |
 | AE-Min | 50.0% | 3.5% | 55.5% |
@@ -91,7 +91,7 @@ speed holds on data we never tuned on, but says nothing about dedup — a
 single text file has ~0% duplication for every algorithm. Absolute GiB/s
 varies across shared hosts; compare within a column.
 
-To reproduce: the corpus is public
+To reproduce: the corpus is public on Tigris
 (`https://mincatcdc-bench-corpus.t3.storage.dev/corpus/MANIFEST.sha256`,
 checksums included), the harness fork is linked above, and
 `BENCH_CORPUS=<dir> cargo bench` runs the in-repo bench on your own files.
@@ -116,7 +116,7 @@ It's a drop-in over the byte-slice chunker — iterate `Segment`s instead of
 `Chunk`s:
 
 ```rust
-use mincatcdc::{CaterpillarChunker, MinCdcHash4};
+use mothcdc::{CaterpillarChunker, MinCdcHash4};
 
 for seg in CaterpillarChunker::new(&data, 4096, 12288, MinCdcHash4::new()) {
     // Store the unique content once. `dedup_key()` returns the bytes to
