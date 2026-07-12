@@ -330,6 +330,30 @@ unsafe fn common_prefix_len_avx512(a: &[u8], b: &[u8]) -> usize {
     let n = a.len().min(b.len());
     let mut i = 0;
     unsafe {
+        // 256 B skip loop; the first block with a mismatch falls through to
+        // the single-vector loop to locate it.
+        while i + 256 <= n {
+            let e0 = _mm512_cmpeq_epi8_mask(
+                _mm512_loadu_si512(a.as_ptr().add(i).cast()),
+                _mm512_loadu_si512(b.as_ptr().add(i).cast()),
+            );
+            let e1 = _mm512_cmpeq_epi8_mask(
+                _mm512_loadu_si512(a.as_ptr().add(i + 64).cast()),
+                _mm512_loadu_si512(b.as_ptr().add(i + 64).cast()),
+            );
+            let e2 = _mm512_cmpeq_epi8_mask(
+                _mm512_loadu_si512(a.as_ptr().add(i + 128).cast()),
+                _mm512_loadu_si512(b.as_ptr().add(i + 128).cast()),
+            );
+            let e3 = _mm512_cmpeq_epi8_mask(
+                _mm512_loadu_si512(a.as_ptr().add(i + 192).cast()),
+                _mm512_loadu_si512(b.as_ptr().add(i + 192).cast()),
+            );
+            if e0 & e1 & e2 & e3 != u64::MAX {
+                break;
+            }
+            i += 256;
+        }
         while i + 64 <= n {
             let va = _mm512_loadu_si512(a.as_ptr().add(i).cast());
             let vb = _mm512_loadu_si512(b.as_ptr().add(i).cast());
@@ -351,6 +375,27 @@ unsafe fn byte_run_len_avx512(data: &[u8], byte: u8) -> usize {
     let needle = _mm512_set1_epi8(byte as i8);
     let mut i = 0;
     unsafe {
+        // 256 B skip loop; see common_prefix_len_avx512.
+        while i + 256 <= n {
+            let e0 =
+                _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(data.as_ptr().add(i).cast()), needle);
+            let e1 = _mm512_cmpeq_epi8_mask(
+                _mm512_loadu_si512(data.as_ptr().add(i + 64).cast()),
+                needle,
+            );
+            let e2 = _mm512_cmpeq_epi8_mask(
+                _mm512_loadu_si512(data.as_ptr().add(i + 128).cast()),
+                needle,
+            );
+            let e3 = _mm512_cmpeq_epi8_mask(
+                _mm512_loadu_si512(data.as_ptr().add(i + 192).cast()),
+                needle,
+            );
+            if e0 & e1 & e2 & e3 != u64::MAX {
+                break;
+            }
+            i += 256;
+        }
         while i + 64 <= n {
             let v = _mm512_loadu_si512(data.as_ptr().add(i).cast());
             let eq = _mm512_cmpeq_epi8_mask(v, needle);
@@ -370,6 +415,31 @@ unsafe fn common_prefix_len_avx2(a: &[u8], b: &[u8]) -> usize {
     let n = a.len().min(b.len());
     let mut i = 0;
     unsafe {
+        // Skip 128 B per iteration while everything matches; the first block
+        // with a mismatch falls through to the single-vector loop to locate it.
+        while i + 128 <= n {
+            let e0 = _mm256_cmpeq_epi8(
+                _mm256_loadu_si256(a.as_ptr().add(i).cast()),
+                _mm256_loadu_si256(b.as_ptr().add(i).cast()),
+            );
+            let e1 = _mm256_cmpeq_epi8(
+                _mm256_loadu_si256(a.as_ptr().add(i + 32).cast()),
+                _mm256_loadu_si256(b.as_ptr().add(i + 32).cast()),
+            );
+            let e2 = _mm256_cmpeq_epi8(
+                _mm256_loadu_si256(a.as_ptr().add(i + 64).cast()),
+                _mm256_loadu_si256(b.as_ptr().add(i + 64).cast()),
+            );
+            let e3 = _mm256_cmpeq_epi8(
+                _mm256_loadu_si256(a.as_ptr().add(i + 96).cast()),
+                _mm256_loadu_si256(b.as_ptr().add(i + 96).cast()),
+            );
+            let all = _mm256_and_si256(_mm256_and_si256(e0, e1), _mm256_and_si256(e2, e3));
+            if _mm256_movemask_epi8(all) as u32 != u32::MAX {
+                break;
+            }
+            i += 128;
+        }
         while i + 32 <= n {
             let va = _mm256_loadu_si256(a.as_ptr().add(i).cast());
             let vb = _mm256_loadu_si256(b.as_ptr().add(i).cast());
@@ -391,6 +461,21 @@ unsafe fn byte_run_len_avx2(data: &[u8], byte: u8) -> usize {
     let needle = _mm256_set1_epi8(byte as i8);
     let mut i = 0;
     unsafe {
+        // 128 B skip loop; see common_prefix_len_avx2.
+        while i + 128 <= n {
+            let e0 = _mm256_cmpeq_epi8(_mm256_loadu_si256(data.as_ptr().add(i).cast()), needle);
+            let e1 =
+                _mm256_cmpeq_epi8(_mm256_loadu_si256(data.as_ptr().add(i + 32).cast()), needle);
+            let e2 =
+                _mm256_cmpeq_epi8(_mm256_loadu_si256(data.as_ptr().add(i + 64).cast()), needle);
+            let e3 =
+                _mm256_cmpeq_epi8(_mm256_loadu_si256(data.as_ptr().add(i + 96).cast()), needle);
+            let all = _mm256_and_si256(_mm256_and_si256(e0, e1), _mm256_and_si256(e2, e3));
+            if _mm256_movemask_epi8(all) as u32 != u32::MAX {
+                break;
+            }
+            i += 128;
+        }
         while i + 32 <= n {
             let v = _mm256_loadu_si256(data.as_ptr().add(i).cast());
             let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, needle)) as u32;

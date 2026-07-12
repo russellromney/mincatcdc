@@ -116,6 +116,28 @@ pub fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
     let n = a.len().min(b.len());
     let mut i = 0;
     unsafe {
+        // Skip 64 B per iteration while everything matches; the first block
+        // with a mismatch falls through to the single-vector loop to locate it.
+        while i + 64 <= n {
+            let e0 = vceqq_u8(vld1q_u8(a.as_ptr().add(i)), vld1q_u8(b.as_ptr().add(i)));
+            let e1 = vceqq_u8(
+                vld1q_u8(a.as_ptr().add(i + 16)),
+                vld1q_u8(b.as_ptr().add(i + 16)),
+            );
+            let e2 = vceqq_u8(
+                vld1q_u8(a.as_ptr().add(i + 32)),
+                vld1q_u8(b.as_ptr().add(i + 32)),
+            );
+            let e3 = vceqq_u8(
+                vld1q_u8(a.as_ptr().add(i + 48)),
+                vld1q_u8(b.as_ptr().add(i + 48)),
+            );
+            let all = vandq_u8(vandq_u8(e0, e1), vandq_u8(e2, e3));
+            if vminvq_u8(all) != 0xFF {
+                break;
+            }
+            i += 64;
+        }
         while i + 16 <= n {
             let va = vld1q_u8(a.as_ptr().add(i));
             let vb = vld1q_u8(b.as_ptr().add(i));
@@ -137,6 +159,18 @@ pub fn byte_run_len(data: &[u8], byte: u8) -> usize {
     let mut i = 0;
     unsafe {
         let needle = vdupq_n_u8(byte);
+        // 64 B skip loop; see common_prefix_len.
+        while i + 64 <= n {
+            let e0 = vceqq_u8(vld1q_u8(data.as_ptr().add(i)), needle);
+            let e1 = vceqq_u8(vld1q_u8(data.as_ptr().add(i + 16)), needle);
+            let e2 = vceqq_u8(vld1q_u8(data.as_ptr().add(i + 32)), needle);
+            let e3 = vceqq_u8(vld1q_u8(data.as_ptr().add(i + 48)), needle);
+            let all = vandq_u8(vandq_u8(e0, e1), vandq_u8(e2, e3));
+            if vminvq_u8(all) != 0xFF {
+                break;
+            }
+            i += 64;
+        }
         while i + 16 <= n {
             let v = vld1q_u8(data.as_ptr().add(i));
             let eq = vceqq_u8(v, needle);
