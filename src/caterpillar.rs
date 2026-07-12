@@ -26,9 +26,10 @@
 //! [`SliceChunker`]). For inputs larger than memory, [`CaterpillarReadChunker`]
 //! does the same coalescing over a streaming [`ReadChunker`] in bounded memory,
 //! yielding borrowed [`Segment`]s (valid until the next call, like
-//! [`ReadChunker::next`](crate::ReadChunker)). It is tier 1 only and never
-//! copies; a run longer than the internal buffer is emitted as several segments
-//! rather than one (still far fewer records than one-per-chunk).
+//! [`ReadChunker::next`](crate::ReadChunker)). Runs coalesce across buffer
+//! refills (a run's unit is copied once — at most `max_size` bytes — when it
+//! crosses a refill), so even a run far longer than the buffer is one record;
+//! everything else is zero-copy.
 //!
 //! # Example
 //! ```
@@ -255,13 +256,14 @@ impl<'a, C: Cdc> Iterator for CaterpillarChunker<'a, C> {
 /// contract as [`ReadChunker::next`](crate::ReadChunker)) — so it never copies
 /// and runs in bounded memory, working on inputs larger than RAM.
 ///
-/// A run longer than the internal buffer is emitted as several segments instead
-/// of one (still far fewer records than one-per-chunk, and every segment's
-/// [`dedup_key`](Segment::dedup_key) is content-defined, so they dedup to one
-/// stored blob). Where those splits land depends on the reader's `read()` sizes,
-/// so the *record grouping* is not reproducible across readers — but the stored
-/// content is, which is what content-addressed dedup relies on. Tier 1 only
-/// (no period detection in the streaming path).
+/// A run is coalesced even when it is longer than the internal buffer: when a
+/// run reaches the end of the buffered data, its unit is copied once (at most
+/// `max_size` bytes per run) and counting continues across refills, so a
+/// multi-gigabyte zero region is still a single record. Segments therefore
+/// group the same way regardless of the reader's `read()` sizes. Everything
+/// else stays zero-copy: solos and runs contained in one buffer borrow the
+/// internal buffer directly. Tier 1 only (no period detection in the
+/// streaming path).
 pub struct CaterpillarReadChunker<R, C> {
     min_size: usize,
     max_size: usize,
@@ -276,6 +278,11 @@ pub struct CaterpillarReadChunker<R, C> {
     /// Length of the chunk at `buf_offset` if already computed by a previous
     /// call's lookahead — avoids recomputing the boundary (a SIMD scan) twice.
     pending_len: Option<usize>,
+    /// A run continued across buffer refills: (owned unit bytes, stream offset
+    /// of the run start, chunks counted so far — always >= 2).
+    carry_run: Option<(Vec<u8>, usize, usize)>,
+    /// Owns the unit of a carried run while its borrowed [`Segment`] is live.
+    emit_unit: Vec<u8>,
 }
 
 impl<R, C: Cdc> CaterpillarReadChunker<R, C> {
@@ -295,6 +302,8 @@ impl<R, C: Cdc> CaterpillarReadChunker<R, C> {
             eof: false,
             done: false,
             pending_len: None,
+            carry_run: None,
+            emit_unit: Vec::new(),
         }
     }
 
@@ -310,6 +319,30 @@ impl<R, C: Cdc> CaterpillarReadChunker<R, C> {
             self.eof,
             &self.cdc,
         )
+    }
+
+    /// Coalesce byte-identical chunks starting at buffer position `base`, whose
+    /// first (already decided) chunk is `buf[base..base + u]`. Returns
+    /// `(bytes covered, chunks counted, boundary of the next chunk)`, where the
+    /// boundary is `Some(len)` if a differing chunk was decided and `None` if
+    /// it is undecidable without more data.
+    fn coalesce_from(&self, base: usize, u: usize) -> (usize, usize, Option<usize>) {
+        // Packed-scanning fast path: guaranteed repeats within the buffered
+        // region cost one equality scan instead of one boundary search each.
+        let repeats = packed_repeats(&self.buf[base..base + self.unread], u, self.max_size);
+        let mut run_len = u + repeats * u;
+        let mut count = 1 + repeats;
+        loop {
+            let cur = base + run_len;
+            let avail = self.unread - run_len;
+            match self.chunk_len(cur, avail) {
+                Some(nl) if nl == u && self.buf[cur..cur + nl] == self.buf[base..base + u] => {
+                    count += 1;
+                    run_len += nl;
+                },
+                other => return (run_len, count, other),
+            }
+        }
     }
 }
 
@@ -345,74 +378,97 @@ impl<R: Read, C: Cdc> CaterpillarReadChunker<R, C> {
         if self.done {
             return Ok(None);
         }
-        self.ensure()?;
-        if self.unread == 0 {
-            self.done = true;
-            return Ok(None);
-        }
-
-        let base = self.buf_offset;
-        let base_stream = self.stream_offset;
-        // Reuse the boundary the previous call already computed, if any.
-        let unit_len = match self.pending_len.take() {
-            Some(l) => l,
-            None => self
-                .chunk_len(base, self.unread)
-                .expect("buffer was ensured but the first chunk could not be decided"),
-        };
-
-        // Coalesce identical adjacent chunks within the buffered region (no refill
-        // mid-run, so the unit borrow stays valid).
-        let mut run_len = unit_len;
-        let mut count = 1usize;
-
-        // Packed-scanning fast path, same as the slice chunker: guaranteed
-        // repeats within the buffered region cost one equality scan instead of
-        // one boundary search each. `pending_len` is untouched — the loop below
-        // computes the first undecided boundary as usual.
-        let repeats = packed_repeats(&self.buf[base..base + self.unread], unit_len, self.max_size);
-        count += repeats;
-        run_len += repeats * unit_len;
-
         loop {
-            let cur = base + run_len;
-            let avail = self.unread - run_len;
-            match self.chunk_len(cur, avail) {
-                Some(nl)
-                    if nl == unit_len
-                        && self.buf[cur..cur + nl] == self.buf[base..base + unit_len] =>
-                {
-                    count += 1;
-                    run_len += nl;
-                },
-                // Next chunk differs: stash its already-computed length so the
-                // next call doesn't recompute the boundary.
-                Some(nl) => {
-                    self.pending_len = Some(nl);
-                    break;
-                },
-                // Can't decide without a refill: recompute next call.
-                None => {
-                    self.pending_len = None;
-                    break;
-                },
+            self.ensure()?;
+            let base = self.buf_offset;
+
+            if self.unread == 0 {
+                self.done = true;
+                // The stream ended exactly at a carried run's boundary.
+                return Ok(self.carry_run.take().map(|(unit, off, count)| {
+                    self.emit_unit = unit;
+                    Segment::Caterpillar {
+                        offset: off,
+                        unit: &self.emit_unit,
+                        count,
+                    }
+                }));
             }
+
+            // A run carried across a refill: does it continue at the front of
+            // the freshly filled buffer?
+            if let Some((unit, run_off, carried)) = self.carry_run.take() {
+                let u = unit.len();
+                match self.chunk_len(base, self.unread) {
+                    Some(l) if l == u && self.buf[base..base + l] == unit[..] => {
+                        // It continues; coalesce through this buffer too.
+                        let (run_len, more, pend) = self.coalesce_from(base, u);
+                        self.buf_offset += run_len;
+                        self.unread -= run_len;
+                        self.stream_offset += run_len;
+                        let count = carried + more;
+                        if pend.is_none() && !self.eof {
+                            // Ran out of buffer again mid-run: keep carrying.
+                            self.carry_run = Some((unit, run_off, count));
+                            continue;
+                        }
+                        self.pending_len = pend;
+                        self.emit_unit = unit;
+                        return Ok(Some(Segment::Caterpillar {
+                            offset: run_off,
+                            unit: &self.emit_unit,
+                            count,
+                        }));
+                    },
+                    // The run ended at the refill boundary: emit it and stash
+                    // the just-computed boundary (if any) for the next call.
+                    boundary => {
+                        self.pending_len = boundary;
+                        self.emit_unit = unit;
+                        return Ok(Some(Segment::Caterpillar {
+                            offset: run_off,
+                            unit: &self.emit_unit,
+                            count: carried,
+                        }));
+                    },
+                }
+            }
+
+            // Fresh segment. Reuse the boundary a previous call computed, if any.
+            let base_stream = self.stream_offset;
+            let unit_len = match self.pending_len.take() {
+                Some(l) => l,
+                None => self
+                    .chunk_len(base, self.unread)
+                    .expect("buffer was ensured but the first chunk could not be decided"),
+            };
+
+            let (run_len, count, pend) = self.coalesce_from(base, unit_len);
+            self.buf_offset += run_len;
+            self.unread -= run_len;
+            self.stream_offset += run_len;
+
+            if pend.is_none() && !self.eof && count >= 2 {
+                // The run reached the end of the buffered data and may continue
+                // after a refill: copy the unit (once per crossing run) and
+                // keep counting instead of splitting the record.
+                self.carry_run =
+                    Some((self.buf[base..base + unit_len].to_vec(), base_stream, count));
+                continue;
+            }
+            self.pending_len = pend;
+
+            let seg = if count >= 2 {
+                Segment::Caterpillar {
+                    offset: base_stream,
+                    unit: &self.buf[base..base + unit_len],
+                    count,
+                }
+            } else {
+                Segment::Solo(Chunk::new(&self.buf[base..base + unit_len], base_stream))
+            };
+            return Ok(Some(seg));
         }
-
-        self.buf_offset += run_len;
-        self.unread -= run_len;
-        self.stream_offset += run_len;
-
-        let seg = if count >= 2 {
-            Segment::Caterpillar {
-                offset: base_stream,
-                unit: &self.buf[base..base + unit_len],
-                count,
-            }
-        } else {
-            Segment::Solo(Chunk::new(&self.buf[base..base + unit_len], base_stream))
-        };
-        Ok(Some(seg))
     }
 }
 
@@ -653,6 +709,58 @@ mod tests {
             }
             assert_matches_reference("prop", &data, min, min + extra);
         }
+    }
+
+    /// A run far longer than the internal buffer (4 MiB) must still be a
+    /// single record: the streaming caterpillar carries runs across refills.
+    #[test]
+    fn streaming_run_crossing_refills_is_one_record() {
+        use std::io::Cursor;
+
+        // 24 MiB of zeros -> crosses the 4 MiB buffer several times.
+        let n = 24 * 1024 * 1024;
+        let data = vec![0u8; n];
+        let mut rc = CaterpillarReadChunker::new(Cursor::new(&data), MIN, MAX, MinCdcHash4::new());
+        let mut records = 0usize;
+        let mut chunks = 0usize;
+        let mut covered = 0usize;
+        while let Some(s) = rc.next().unwrap() {
+            records += 1;
+            chunks += s.chunk_count();
+            covered += s.len();
+            assert!(s.dedup_key().iter().all(|&b| b == 0));
+        }
+        assert_eq!(covered, n);
+        let plain = SliceChunker::new(&data, MIN, MAX, MinCdcHash4::new()).count();
+        assert_eq!(chunks, plain, "must represent the same underlying chunks");
+        assert!(
+            records <= 2,
+            "a single giant run must not split at buffer refills (got {records} records)"
+        );
+
+        // And a run bracketed by random data still carries across refills.
+        let mut data = xorshift(11, 64 * 1024);
+        data.extend_from_slice(&vec![0u8; 12 * 1024 * 1024]);
+        data.extend_from_slice(&xorshift(12, 64 * 1024));
+        let mut rc = CaterpillarReadChunker::new(Cursor::new(&data), MIN, MAX, MinCdcHash4::new());
+        let (mut records, mut chunks, mut covered) = (0usize, 0usize, 0usize);
+        let mut rebuilt = Vec::with_capacity(data.len());
+        while let Some(s) = rc.next().unwrap() {
+            records += 1;
+            chunks += s.chunk_count();
+            covered += s.len();
+            s.reconstruct_into(&mut rebuilt);
+        }
+        assert_eq!(covered, data.len());
+        assert_eq!(rebuilt, data, "must reconstruct exactly");
+        let plain = SliceChunker::new(&data, MIN, MAX, MinCdcHash4::new()).count();
+        assert_eq!(chunks, plain);
+        // ~64 KiB of random on each side is ~40-70 records; the 12 MiB zero
+        // run must contribute ~1, not ~3 (one per 4 MiB refill).
+        assert!(
+            records < 120,
+            "zero run appears to split at refills (got {records} records)"
+        );
     }
 
     #[test]
