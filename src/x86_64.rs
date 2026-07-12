@@ -5,6 +5,14 @@ use crate::scalar;
 
 const PREFETCH_DIST: usize = 16384;
 
+#[inline(always)]
+fn prefetch_ptr(bytes: &[u8], offset: usize) -> *const i8 {
+    bytes
+        .as_ptr()
+        .wrapping_add(offset.wrapping_add(PREFETCH_DIST))
+        .cast()
+}
+
 // The avx512_impl, avx2_impl or sse41_impl finds a position which has the
 // global minimizer within the next four bytes.
 
@@ -32,7 +40,11 @@ unsafe fn avx512_impl<const SHOULD_HASH: bool>(
                 offset = bytes.len() - 64 - 3;
             }
 
-            _mm_prefetch::<_MM_HINT_T0>(bytes.as_ptr().add(offset + PREFETCH_DIST).cast());
+            // The prefetch target routinely lies beyond the allocation. Even
+            // though PREFETCH itself is non-faulting, `ptr::add` requires the
+            // computed pointer to remain within the allocation. `wrapping_add`
+            // avoids creating an invalid in-bounds-derived pointer.
+            _mm_prefetch::<_MM_HINT_T0>(prefetch_ptr(bytes, offset));
 
             let mut v0 = _mm512_loadu_si512(bytes.as_ptr().add(offset).cast());
             let mut v1 = _mm512_loadu_si512(bytes.as_ptr().add(offset + 1).cast());
@@ -136,7 +148,7 @@ unsafe fn avx2_impl<const SHOULD_HASH: bool>(bytes: &[u8], multiplier: u32, adde
 
     unsafe {
         while offset + 64 + 4 <= bytes.len() {
-            _mm_prefetch::<_MM_HINT_T0>(bytes.as_ptr().add(offset + PREFETCH_DIST).cast());
+            _mm_prefetch::<_MM_HINT_T0>(prefetch_ptr(bytes, offset));
 
             // Manually unrolled twice.
             body(&mut offset);
@@ -220,7 +232,7 @@ fn sse41_impl<const SHOULD_HASH: bool>(bytes: &[u8], multiplier: u32, addend: u3
 
     unsafe {
         while offset + 32 + 4 <= bytes.len() {
-            _mm_prefetch::<_MM_HINT_T0>(bytes.as_ptr().add(offset + PREFETCH_DIST).cast());
+            _mm_prefetch::<_MM_HINT_T0>(prefetch_ptr(bytes, offset));
 
             // Manually unrolled twice.
             body(&mut offset);
@@ -297,5 +309,18 @@ pub fn argmin_u32_overlapping_hashed<const SHOULD_HASH: bool>(
         within_four_offset + final_bump
     } else {
         within_four_offset
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefetch_pointer_may_wrap_beyond_a_short_slice() {
+        let bytes = [0u8; 1];
+        let got = prefetch_ptr(&bytes, 0);
+        let expected = bytes.as_ptr().wrapping_add(PREFETCH_DIST).cast::<i8>();
+        assert_eq!(got, expected);
     }
 }
