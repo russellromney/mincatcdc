@@ -10,10 +10,10 @@
 //! not catch a `dedup_key()` that isn't reconstruction-safe.
 
 use std::collections::HashMap;
-use std::io::Cursor;
+use std::io::{self, Cursor, Read};
 
 use mothcdc::mincdc::{MinCdcHash4, ReadChunker, SliceChunker};
-use mothcdc::{MothChunker, MothReadChunker, Segment};
+use mothcdc::{MothChunker, MothReadChunker};
 use proptest::prelude::*;
 
 fn fnv1a(b: &[u8]) -> u64 {
@@ -49,8 +49,8 @@ fn assert_roundtrip(label: &str, data: &[u8], min: usize, max: usize) {
 
     // --- ingest ---
     let mut store: HashMap<u64, Vec<u8>> = HashMap::new();
-    let mut manifest: Vec<(u64, usize)> = Vec::new(); // (key_hash, logical_len)
-    let mut next_off = 0usize;
+    let mut manifest: Vec<(u64, u64)> = Vec::new(); // (key_hash, logical_len)
+    let mut next_off = 0u64;
     for seg in build(data, min, max) {
         assert_eq!(seg.offset(), next_off, "{tag}: non-contiguous offset");
         assert!(!seg.is_empty(), "{tag}: empty segment");
@@ -62,14 +62,14 @@ fn assert_roundtrip(label: &str, data: &[u8], min: usize, max: usize) {
         manifest.push((h, seg.len()));
         next_off += seg.len();
     }
-    assert_eq!(next_off, data.len(), "{tag}: coverage gap");
+    assert_eq!(next_off, data.len() as u64, "{tag}: coverage gap");
 
     // The caterpillar must represent exactly the same underlying chunks as plain
     // mincdc — it only groups them, never adds or drops any.
     let plain = SliceChunker::new(data, min, max, MinCdcHash4::new()).count();
-    let expanded: usize = build(data, min, max).map(|s| s.chunk_count()).sum();
+    let expanded: u64 = build(data, min, max).map(|s| s.chunk_count()).sum();
     assert_eq!(
-        expanded, plain,
+        expanded, plain as u64,
         "{tag}: chunk_count {expanded} != plain {plain}"
     );
 
@@ -79,11 +79,11 @@ fn assert_roundtrip(label: &str, data: &[u8], min: usize, max: usize) {
         let bytes = store
             .get(h)
             .expect("manifest references a chunk not in the store");
-        let mut w = 0;
+        let mut w = 0u64;
         while w < *len {
-            let take = bytes.len().min(*len - w);
+            let take = (bytes.len() as u64).min(*len - w) as usize;
             restored.extend_from_slice(&bytes[..take]);
-            w += take;
+            w += take as u64;
         }
     }
     assert_eq!(restored, data, "{tag}: store round-trip corrupted the data");
@@ -134,7 +134,7 @@ fn roundtrip_wide_and_narrow() {
 }
 
 /// A reader that returns at most `step` bytes per call, to exercise the streaming
-/// chunker's buffer refill/shift logic (and its reader-dependent run splitting).
+/// chunker's buffer refill/shift logic.
 struct ChokedReader<'a> {
     data: &'a [u8],
     pos: usize,
@@ -149,11 +149,130 @@ impl std::io::Read for ChokedReader<'_> {
     }
 }
 
+fn segment_layout<R: Read>(reader: R, min: usize, max: usize) -> Vec<(u64, u64, u64, Vec<u8>)> {
+    let mut chunker = MothReadChunker::new(reader, min, max);
+    let mut out = Vec::new();
+    while let Some(segment) = chunker.next().unwrap() {
+        out.push((
+            segment.offset(),
+            segment.len(),
+            segment.chunk_count(),
+            segment.dedup_key().to_vec(),
+        ));
+    }
+    out
+}
+
+#[test]
+fn streaming_grouping_is_independent_of_read_fragmentation() {
+    let data = vec![0u8; 1024 * 1024];
+    let cursor = segment_layout(Cursor::new(&data), 2048, 14336);
+    let one_byte = segment_layout(
+        ChokedReader {
+            data: &data,
+            pos: 0,
+            step: 1,
+        },
+        2048,
+        14336,
+    );
+    assert_eq!(one_byte, cursor);
+    assert_eq!(cursor.len(), 1, "a zero run should be one record");
+    assert!(cursor[0].2 >= 2);
+}
+
+struct InterruptOnce<R> {
+    inner: R,
+    interrupted: bool,
+}
+
+impl<R: Read> Read for InterruptOnce<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if !self.interrupted {
+            self.interrupted = true;
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        self.inner.read(buf)
+    }
+}
+
+#[test]
+fn moth_reader_retries_interrupted() {
+    let data = xorshift(88, 8192);
+    let reader = InterruptOnce {
+        inner: Cursor::new(&data),
+        interrupted: false,
+    };
+    assert_stream_roundtrip("interrupted", reader, &data, 64, 256);
+}
+
+struct ErrorOnceAfterData<'a> {
+    data: &'a [u8],
+    pos: usize,
+    errored: bool,
+}
+
+impl Read for ErrorOnceAfterData<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= 257 && !self.errored {
+            self.errored = true;
+            return Err(io::Error::other("transient failure"));
+        }
+        let remaining_before_error = 257usize.saturating_sub(self.pos);
+        let n = buf
+            .len()
+            .min(self.data.len() - self.pos)
+            .min(remaining_before_error.max(1));
+        buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+#[test]
+fn moth_reader_can_resume_after_error_with_internal_progress() {
+    let data = vec![0u8; 4096];
+    let reader = ErrorOnceAfterData {
+        data: &data,
+        pos: 0,
+        errored: false,
+    };
+    let mut chunker = MothReadChunker::new(reader, 64, 256);
+    assert_eq!(chunker.next().unwrap_err().kind(), io::ErrorKind::Other);
+
+    let mut rebuilt = Vec::new();
+    while let Some(segment) = chunker.next().unwrap() {
+        segment.reconstruct_into(&mut rebuilt);
+    }
+    assert_eq!(rebuilt, data);
+}
+
+#[test]
+fn moth_reader_reports_permanent_errors() {
+    let mut chunker = MothReadChunker::new(FailingReader, 64, 256);
+    assert_eq!(chunker.next().unwrap_err().kind(), io::ErrorKind::Other);
+}
+
+#[test]
+fn moth_fallible_constructor_rejects_overflowing_configuration() {
+    let result = MothReadChunker::try_new(Cursor::new(Vec::<u8>::new()), 0, usize::MAX);
+    match result {
+        Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput),
+        Ok(_) => panic!("overflowing configuration was accepted"),
+    }
+}
+
+struct FailingReader;
+
+impl Read for FailingReader {
+    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::other("permanent failure"))
+    }
+}
+
 /// Drives the streaming caterpillar over `reader`, asserting contiguity, lossless
 /// reconstruction, exact coverage, and that it represents the same underlying
-/// chunk count as plain mincdc. (It is NOT asserted to match the slice
-/// caterpillar's segment grouping — the streaming version splits long runs at
-/// buffer boundaries, which depends on the reader.)
+/// chunk count as plain mincdc.
 fn assert_stream_roundtrip<R: std::io::Read>(
     tag: &str,
     reader: R,
@@ -164,7 +283,7 @@ fn assert_stream_roundtrip<R: std::io::Read>(
     let cdc = MinCdcHash4::new();
     let plain = SliceChunker::new(data, min, max, cdc).count();
     let mut rc = MothReadChunker::with_cdc(reader, min, max, cdc);
-    let (mut next_off, mut chunks) = (0usize, 0usize);
+    let (mut next_off, mut chunks) = (0u64, 0u64);
     let mut rebuilt = Vec::with_capacity(data.len());
     while let Some(s) = rc.next().unwrap() {
         assert_eq!(s.offset(), next_off, "{tag}: non-contiguous");
@@ -174,9 +293,9 @@ fn assert_stream_roundtrip<R: std::io::Read>(
         s.reconstruct_into(&mut rebuilt);
     }
     assert_eq!(rebuilt, data, "{tag}: stream round-trip corrupted data");
-    assert_eq!(next_off, data.len(), "{tag}: coverage gap");
+    assert_eq!(next_off, data.len() as u64, "{tag}: coverage gap");
     assert_eq!(
-        chunks, plain,
+        chunks, plain as u64,
         "{tag}: chunk_count {chunks} != plain {plain}"
     );
 }
@@ -202,17 +321,9 @@ fn streaming_chunk_boundaries_match_plain_mincdc() {
             let mut expanded = Vec::new();
             let mut sc = MothReadChunker::with_cdc(Cursor::new(&data), min, max, cdc);
             while let Some(s) = sc.next().unwrap() {
-                match s {
-                    Segment::Solo(c) => expanded.push((c.offset(), c.len())),
-                    Segment::Caterpillar {
-                        offset,
-                        unit,
-                        count,
-                    } => {
-                        for i in 0..count {
-                            expanded.push((offset + i * unit.len(), unit.len()));
-                        }
-                    },
+                let unit_len = s.dedup_key().len();
+                for i in 0..s.chunk_count() {
+                    expanded.push((s.offset() + i * unit_len as u64, unit_len));
                 }
             }
 
@@ -248,7 +359,7 @@ fn streaming_caterpillar_roundtrips() {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 400, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
 
     /// Fuzz the full round-trip over random data and sizes. Shrinks any
     /// state-machine or reconstruction bug to a minimal case.

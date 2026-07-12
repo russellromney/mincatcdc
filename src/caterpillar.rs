@@ -6,9 +6,9 @@
 //! zero-fill or repeated-record region costs metadata out of all proportion to
 //! its information content.
 //!
-//! [`MothChunker`] wraps a [`SliceChunker`] and run-length-encodes
-//! maximal runs of byte-identical adjacent chunks into a single
-//! [`Segment::Caterpillar`] record (the unit + a repeat count). It catches
+//! [`MothChunker`] wraps a [`SliceChunker`](crate::mincdc::SliceChunker) and run-length-encodes
+//! maximal runs of byte-identical adjacent chunks into a single [`Segment`]
+//! record (the unit + a repeat count). It catches
 //! zero-fill, constant bytes, and repeated blocks; it is a no-op (one slice
 //! compare per chunk) on data with no runs, so it keeps mincdc's speed and
 //! deduplication everywhere else. The output is lossless.
@@ -23,8 +23,9 @@
 //! numbers).
 //!
 //! [`MothChunker`] works on an in-memory byte slice (it wraps
-//! [`SliceChunker`]). For inputs larger than memory, [`MothReadChunker`]
-//! does the same coalescing over a streaming [`ReadChunker`] in bounded memory,
+//! [`SliceChunker`](crate::mincdc::SliceChunker)). For inputs larger than memory,
+//! [`MothReadChunker`] does the same coalescing over a streaming
+//! [`ReadChunker`](crate::mincdc::ReadChunker) in bounded memory,
 //! yielding borrowed [`Segment`]s (valid until the next call, like
 //! [`ReadChunker::next`](crate::mincdc::ReadChunker)). Runs coalesce across buffer
 //! refills (a run's unit is copied once — at most `max_size` bytes — when it
@@ -40,7 +41,7 @@
 //!
 //! // The whole zero run collapses into one record instead of ~64 chunks.
 //! assert_eq!(segs.len(), 1);
-//! assert!(matches!(segs[0], Segment::Caterpillar { .. }));
+//! assert!(segs[0].is_caterpillar());
 //! // `dedup_key()` gives the unique bytes to fingerprint/store, regardless of variant.
 //! assert!(segs[0].dedup_key().iter().all(|&b| b == 0));
 //! ```
@@ -128,42 +129,62 @@ pub(crate) fn packed_repeats(tail: &[u8], u: usize, max_size: usize) -> usize {
 /// **only until the next call**. Process it (or copy [`dedup_key`](Self::dedup_key))
 /// before advancing the streaming chunker.
 #[derive(Debug)]
-pub enum Segment<'a> {
-    /// A single chunk whose neighbor differed — emitted as-is.
+pub struct Segment<'a> {
+    kind: SegmentKind<'a>,
+}
+
+#[derive(Debug)]
+enum SegmentKind<'a> {
     Solo(Chunk<'a>),
-    /// A run of `count` (>= 2) byte-identical adjacent chunks (tier 1).
     Caterpillar {
-        /// Start offset of the run within the input.
-        offset: usize,
-        /// The repeated chunk's bytes.
+        offset: u64,
         unit: &'a [u8],
-        /// Number of times `unit` repeats (>= 2).
-        count: usize,
+        count: u64,
     },
 }
 
 impl<'a> Segment<'a> {
-    /// Start offset of this segment within the input.
-    pub fn offset(&self) -> usize {
-        match self {
-            Segment::Solo(c) => c.offset(),
-            Segment::Caterpillar { offset, .. } => *offset,
+    fn solo(chunk: Chunk<'a>) -> Self {
+        Self {
+            kind: SegmentKind::Solo(chunk),
         }
     }
 
-    /// Number of underlying chunks represented (1 for [`Segment::Solo`]).
-    pub fn chunk_count(&self) -> usize {
-        match self {
-            Segment::Solo(_) => 1,
-            Segment::Caterpillar { count, .. } => *count,
+    fn caterpillar(offset: u64, unit: &'a [u8], count: u64) -> Self {
+        debug_assert!(!unit.is_empty());
+        debug_assert!(count >= 2);
+        Self {
+            kind: SegmentKind::Caterpillar {
+                offset,
+                unit,
+                count,
+            },
+        }
+    }
+
+    /// Start offset of this segment within the input.
+    pub fn offset(&self) -> u64 {
+        match &self.kind {
+            SegmentKind::Solo(c) => c.offset(),
+            SegmentKind::Caterpillar { offset, .. } => *offset,
+        }
+    }
+
+    /// Number of underlying chunks represented (one for a solo segment).
+    pub fn chunk_count(&self) -> u64 {
+        match &self.kind {
+            SegmentKind::Solo(_) => 1,
+            SegmentKind::Caterpillar { count, .. } => *count,
         }
     }
 
     /// Total number of bytes covered by this segment.
-    pub fn len(&self) -> usize {
-        match self {
-            Segment::Solo(c) => c.len(),
-            Segment::Caterpillar { unit, count, .. } => unit.len() * count,
+    pub fn len(&self) -> u64 {
+        match &self.kind {
+            SegmentKind::Solo(c) => c.len() as u64,
+            SegmentKind::Caterpillar { unit, count, .. } => (unit.len() as u64)
+                .checked_mul(*count)
+                .expect("validated segment length exceeded u64::MAX"),
         }
     }
 
@@ -172,9 +193,13 @@ impl<'a> Segment<'a> {
         self.len() == 0
     }
 
+    /// Whether this segment represents two or more identical adjacent chunks.
+    pub fn is_caterpillar(&self) -> bool {
+        matches!(self.kind, SegmentKind::Caterpillar { .. })
+    }
+
     /// The unique content to fingerprint and store for content addressing: the
-    /// chunk bytes ([`Segment::Solo`]) or the repeated unit
-    /// ([`Segment::Caterpillar`]).
+    /// solo chunk bytes or the repeated unit.
     ///
     /// This is also exactly the bytes to tile back to [`len`](Self::len) to
     /// reconstruct the segment, so a store-then-restore round-trip is lossless:
@@ -182,24 +207,24 @@ impl<'a> Segment<'a> {
     /// [`len`](Self::len), and on restore tile the stored bytes to `len`. See
     /// [`reconstruct_into`](Self::reconstruct_into).
     pub fn dedup_key(&self) -> &[u8] {
-        match self {
-            Segment::Solo(c) => c,
-            Segment::Caterpillar { unit, .. } => unit,
+        match &self.kind {
+            SegmentKind::Solo(c) => c,
+            SegmentKind::Caterpillar { unit, .. } => unit,
         }
     }
 
     /// Appends this segment's original bytes to `out` (the inverse of chunking):
-    /// the chunk for [`Segment::Solo`] or the unit repeated `count` times for
-    /// [`Segment::Caterpillar`]. Equivalent to tiling [`dedup_key`](Self::dedup_key)
+    /// the solo chunk or the unit repeated `count` times. Equivalent to tiling
+    /// [`dedup_key`](Self::dedup_key)
     /// to [`len`](Self::len).
     pub fn reconstruct_into(&self, out: &mut Vec<u8>) {
         let key = self.dedup_key();
         let total = self.len();
-        let mut written = 0;
+        let mut written = 0u64;
         while written < total {
-            let take = key.len().min(total - written);
+            let take = (key.len() as u64).min(total - written) as usize;
             out.extend_from_slice(&key[..take]);
-            written += take;
+            written += take as u64;
         }
     }
 }
@@ -238,7 +263,7 @@ impl<'a, C: Cdc> Iterator for MothChunker<'a, C> {
 
     fn next(&mut self) -> Option<Segment<'a>> {
         let first = self.carry.take().or_else(|| self.inner.next())?;
-        let start = first.offset();
+        let start = usize::try_from(first.offset()).expect("slice offset does not fit usize");
         let first_len = first.len();
         let unit: &'a [u8] = &self.data[start..start + first_len];
 
@@ -264,13 +289,9 @@ impl<'a, C: Cdc> Iterator for MothChunker<'a, C> {
         };
         self.carry = pending;
         if count >= 2 {
-            Some(Segment::Caterpillar {
-                offset: start,
-                unit,
-                count,
-            })
+            Some(Segment::caterpillar(start as u64, unit, count as u64))
         } else {
-            Some(Segment::Solo(first))
+            Some(Segment::solo(first))
         }
     }
 }
@@ -298,24 +319,31 @@ pub struct MothReadChunker<R, C = MinCdcHash4> {
     buf: Vec<u8>,
     buf_offset: usize,
     unread: usize,
-    stream_offset: usize,
+    stream_offset: u64,
     eof: bool,
     done: bool,
     /// Length of the chunk at `buf_offset` if already computed by a previous
     /// call's lookahead — avoids recomputing the boundary (a SIMD scan) twice.
     pending_len: Option<usize>,
     /// A run continued across buffer refills: (owned unit bytes, stream offset
-    /// of the run start, chunks counted so far — always >= 2).
-    carry_run: Option<(Vec<u8>, usize, usize)>,
+    /// of the run start, chunks counted so far — always >= 1). A singleton is
+    /// retained only when its neighbor needs another reader refill to decide.
+    carry_run: Option<(Vec<u8>, u64, u64)>,
     /// Owns the unit of a carried run while its borrowed [`Segment`] is live.
     emit_unit: Vec<u8>,
 }
 
 impl<R> MothReadChunker<R, MinCdcHash4> {
     /// Creates a zero-copy streaming caterpillar chunker using [`MinCdcHash4`]
-    /// with the default hash parameters.
+    /// with the default hash parameters. It allocates at least 4 MiB; use
+    /// [`MothReadChunker::try_new`] to handle invalid sizes or allocation failure.
     pub fn new(reader: R, min_size: usize, max_size: usize) -> Self {
         Self::with_cdc(reader, min_size, max_size, MinCdcHash4::new())
+    }
+
+    /// Tries to create a streaming chunker without arithmetic or allocation panics.
+    pub fn try_new(reader: R, min_size: usize, max_size: usize) -> io::Result<Self> {
+        Self::try_with_cdc(reader, min_size, max_size, MinCdcHash4::new())
     }
 }
 
@@ -324,14 +352,23 @@ impl<R, C: Cdc> MothReadChunker<R, C> {
     /// instance (e.g. [`MinCdcHash4::with_params`] or
     /// [`MinCdc4`](crate::mincdc::MinCdc4)).
     pub fn with_cdc(reader: R, min_size: usize, max_size: usize, cdc: C) -> Self {
-        assert!(min_size <= max_size && max_size > 0);
-        let buf_size = crate::MIN_BUFFER_SIZE + (max_size + 1) + min_size * 4;
-        Self {
+        Self::try_with_cdc(reader, min_size, max_size, cdc)
+            .expect("invalid MothReadChunker configuration or buffer allocation failed")
+    }
+
+    /// Tries to create a streaming chunker with a custom [`Cdc`] instance.
+    pub fn try_with_cdc(reader: R, min_size: usize, max_size: usize, cdc: C) -> io::Result<Self> {
+        let buf_size = crate::mincdc::checked_buffer_size(min_size, max_size)?;
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(buf_size)
+            .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
+        buf.resize(buf_size, 0);
+        Ok(Self {
             min_size,
             max_size,
             cdc,
             reader,
-            buf: vec![0; buf_size],
+            buf,
             buf_offset: 0,
             unread: 0,
             stream_offset: 0,
@@ -340,7 +377,24 @@ impl<R, C: Cdc> MothReadChunker<R, C> {
             pending_len: None,
             carry_run: None,
             emit_unit: Vec::new(),
-        }
+        })
+    }
+
+    /// Returns a shared reference to the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.reader
+    }
+
+    /// Returns a mutable reference to the underlying reader.
+    ///
+    /// Reading from it directly can invalidate chunker state.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.reader
+    }
+
+    /// Returns the underlying reader, discarding any bytes already read ahead.
+    pub fn into_inner(self) -> R {
+        self.reader
     }
 
     /// Length of the chunk starting at buffer position `p` given `avail` buffered
@@ -393,9 +447,15 @@ impl<R: Read, C: Cdc> MothReadChunker<R, C> {
                     .copy_within(self.buf_offset..self.buf_offset + self.unread, 0);
                 self.buf_offset = 0;
             }
-            let n = self
-                .reader
-                .read(&mut self.buf[self.buf_offset + self.unread..])?;
+            let n = loop {
+                match self
+                    .reader
+                    .read(&mut self.buf[self.buf_offset + self.unread..])
+                {
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    result => break result?,
+                }
+            };
             if n == 0 {
                 self.eof = true;
                 break;
@@ -423,10 +483,10 @@ impl<R: Read, C: Cdc> MothReadChunker<R, C> {
                 // The stream ended exactly at a carried run's boundary.
                 return Ok(self.carry_run.take().map(|(unit, off, count)| {
                     self.emit_unit = unit;
-                    Segment::Caterpillar {
-                        offset: off,
-                        unit: &self.emit_unit,
-                        count,
+                    if count >= 2 {
+                        Segment::caterpillar(off, &self.emit_unit, count)
+                    } else {
+                        Segment::solo(Chunk::new(&self.emit_unit, off))
                     }
                 }));
             }
@@ -441,8 +501,21 @@ impl<R: Read, C: Cdc> MothReadChunker<R, C> {
                         let (run_len, more, pend) = self.coalesce_from(base, u);
                         self.buf_offset += run_len;
                         self.unread -= run_len;
-                        self.stream_offset += run_len;
-                        let count = carried + more;
+                        self.stream_offset = self
+                            .stream_offset
+                            .checked_add(run_len as u64)
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "stream offset exceeded u64::MAX",
+                                )
+                            })?;
+                        let count = carried.checked_add(more as u64).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "segment chunk count exceeded u64::MAX",
+                            )
+                        })?;
                         if pend.is_none() && !self.eof {
                             // Ran out of buffer again mid-run: keep carrying.
                             self.carry_run = Some((unit, run_off, count));
@@ -450,22 +523,19 @@ impl<R: Read, C: Cdc> MothReadChunker<R, C> {
                         }
                         self.pending_len = pend;
                         self.emit_unit = unit;
-                        return Ok(Some(Segment::Caterpillar {
-                            offset: run_off,
-                            unit: &self.emit_unit,
-                            count,
-                        }));
+                        return Ok(Some(Segment::caterpillar(run_off, &self.emit_unit, count)));
                     },
                     // The run ended at the refill boundary: emit it and stash
                     // the just-computed boundary (if any) for the next call.
                     boundary => {
                         self.pending_len = boundary;
                         self.emit_unit = unit;
-                        return Ok(Some(Segment::Caterpillar {
-                            offset: run_off,
-                            unit: &self.emit_unit,
-                            count: carried,
-                        }));
+                        let segment = if carried >= 2 {
+                            Segment::caterpillar(run_off, &self.emit_unit, carried)
+                        } else {
+                            Segment::solo(Chunk::new(&self.emit_unit, run_off))
+                        };
+                        return Ok(Some(segment));
                     },
                 }
             }
@@ -482,26 +552,33 @@ impl<R: Read, C: Cdc> MothReadChunker<R, C> {
             let (run_len, count, pend) = self.coalesce_from(base, unit_len);
             self.buf_offset += run_len;
             self.unread -= run_len;
-            self.stream_offset += run_len;
+            self.stream_offset =
+                self.stream_offset
+                    .checked_add(run_len as u64)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "stream offset exceeded u64::MAX",
+                        )
+                    })?;
 
-            if pend.is_none() && !self.eof && count >= 2 {
-                // The run reached the end of the buffered data and may continue
-                // after a refill: copy the unit (once per crossing run) and
-                // keep counting instead of splitting the record.
-                self.carry_run =
-                    Some((self.buf[base..base + unit_len].to_vec(), base_stream, count));
+            if pend.is_none() && !self.eof {
+                // The next boundary needs another refill. Retain even a
+                // singleton so an arbitrarily fragmented reader cannot split a
+                // repeated run before its identical neighbor is decidable.
+                self.carry_run = Some((
+                    self.buf[base..base + unit_len].to_vec(),
+                    base_stream,
+                    count as u64,
+                ));
                 continue;
             }
             self.pending_len = pend;
 
             let seg = if count >= 2 {
-                Segment::Caterpillar {
-                    offset: base_stream,
-                    unit: &self.buf[base..base + unit_len],
-                    count,
-                }
+                Segment::caterpillar(base_stream, &self.buf[base..base + unit_len], count as u64)
             } else {
-                Segment::Solo(Chunk::new(&self.buf[base..base + unit_len], base_stream))
+                Segment::solo(Chunk::new(&self.buf[base..base + unit_len], base_stream))
             };
             return Ok(Some(seg));
         }
@@ -534,8 +611,8 @@ mod tests {
         let plain = SliceChunker::new(data, min, max, cdc).count();
 
         let mut records = 0usize;
-        let mut expanded = 0usize;
-        let mut next_off = 0usize;
+        let mut expanded = 0u64;
+        let mut next_off = 0u64;
         let mut rebuilt: Vec<u8> = Vec::with_capacity(data.len());
         for s in MothChunker::with_cdc(data, min, max, cdc) {
             assert_eq!(s.offset(), next_off, "{label}: offset not contiguous");
@@ -545,7 +622,10 @@ mod tests {
             next_off += s.len();
         }
         assert_eq!(rebuilt, data, "{label}: must reconstruct input exactly");
-        assert_eq!(expanded, plain, "{label}: must represent same chunk count");
+        assert_eq!(
+            expanded, plain as u64,
+            "{label}: must represent same chunk count"
+        );
         (plain, records)
     }
 
@@ -568,8 +648,8 @@ mod tests {
     /// chunk from the plain chunker and RLE-coalesce byte-identical neighbors.
     /// The packed-scanning fast path must produce exactly this segment stream —
     /// same grouping, same offsets, same unit bytes.
-    fn reference_segments(data: &[u8], min: usize, max: usize) -> Vec<(usize, Vec<u8>, usize)> {
-        let mut out: Vec<(usize, Vec<u8>, usize)> = Vec::new();
+    fn reference_segments(data: &[u8], min: usize, max: usize) -> Vec<(u64, Vec<u8>, u64)> {
+        let mut out: Vec<(u64, Vec<u8>, u64)> = Vec::new();
         for c in SliceChunker::new(data, min, max, MinCdcHash4::new()) {
             match out.last_mut() {
                 Some((_, unit, count)) if unit[..] == c[..] => *count += 1,
@@ -580,15 +660,8 @@ mod tests {
     }
 
     fn assert_matches_reference(label: &str, data: &[u8], min: usize, max: usize) {
-        let got: Vec<(usize, Vec<u8>, usize)> = MothChunker::new(data, min, max)
-            .map(|s| match s {
-                Segment::Solo(c) => (c.offset(), c.to_vec(), 1),
-                Segment::Caterpillar {
-                    offset,
-                    unit,
-                    count,
-                } => (offset, unit.to_vec(), count),
-            })
+        let got: Vec<(u64, Vec<u8>, u64)> = MothChunker::new(data, min, max)
+            .map(|s| (s.offset(), s.dedup_key().to_vec(), s.chunk_count()))
             .collect();
         let want = reference_segments(data, min, max);
         assert_eq!(got, want, "{label} (min={min} max={max})");
@@ -756,17 +829,20 @@ mod tests {
         let data = vec![0u8; n];
         let mut rc = MothReadChunker::new(Cursor::new(&data), MIN, MAX);
         let mut records = 0usize;
-        let mut chunks = 0usize;
-        let mut covered = 0usize;
+        let mut chunks = 0u64;
+        let mut covered = 0u64;
         while let Some(s) = rc.next().unwrap() {
             records += 1;
             chunks += s.chunk_count();
             covered += s.len();
             assert!(s.dedup_key().iter().all(|&b| b == 0));
         }
-        assert_eq!(covered, n);
+        assert_eq!(covered, n as u64);
         let plain = SliceChunker::new(&data, MIN, MAX, MinCdcHash4::new()).count();
-        assert_eq!(chunks, plain, "must represent the same underlying chunks");
+        assert_eq!(
+            chunks, plain as u64,
+            "must represent the same underlying chunks"
+        );
         assert!(
             records <= 2,
             "a single giant run must not split at buffer refills (got {records} records)"
@@ -777,7 +853,7 @@ mod tests {
         data.extend_from_slice(&vec![0u8; 12 * 1024 * 1024]);
         data.extend_from_slice(&xorshift(12, 64 * 1024));
         let mut rc = MothReadChunker::new(Cursor::new(&data), MIN, MAX);
-        let (mut records, mut chunks, mut covered) = (0usize, 0usize, 0usize);
+        let (mut records, mut chunks, mut covered) = (0usize, 0u64, 0u64);
         let mut rebuilt = Vec::with_capacity(data.len());
         while let Some(s) = rc.next().unwrap() {
             records += 1;
@@ -785,10 +861,10 @@ mod tests {
             covered += s.len();
             s.reconstruct_into(&mut rebuilt);
         }
-        assert_eq!(covered, data.len());
+        assert_eq!(covered, data.len() as u64);
         assert_eq!(rebuilt, data, "must reconstruct exactly");
         let plain = SliceChunker::new(&data, MIN, MAX, MinCdcHash4::new()).count();
-        assert_eq!(chunks, plain);
+        assert_eq!(chunks, plain as u64);
         // ~64 KiB of random on each side is ~40-70 records; the 12 MiB zero
         // run must contribute ~1, not ~3 (one per 4 MiB refill).
         assert!(

@@ -4,13 +4,13 @@
 //! of the stable Rust API.
 
 use crate::caterpillar;
-use crate::mincdc::{MinCdcHash4, next_chunk_len};
+use crate::mincdc::{MAX_CHUNK_SIZE, MinCdcHash4, next_chunk_len};
 
 /// Length of the next chunk at the front of `data[..len]`, using
 /// [`MinCdcHash4`] with the default parameters.
 ///
 /// `eof != 0` means `data` is all the data there is. With `eof == 0` at
-/// least `max_size + 1` bytes must be available, or the boundary is
+/// at least `max_size + 1` bytes must be available, or the boundary is
 /// undecidable and 0 is returned (0 is also returned for `len == 0`).
 ///
 /// If `repeats_out` is non-null it receives the number of *additional*
@@ -22,8 +22,10 @@ use crate::mincdc::{MinCdcHash4, next_chunk_len};
 /// periodic. Pass null to skip the packed scan (plain MinCDC).
 ///
 /// # Safety
-/// `data` must point to `len` readable bytes. `repeats_out` must be null or
-/// point to a writable `usize`.
+/// `data` must point to `len` readable bytes in one allocation, and `len` must
+/// not exceed `isize::MAX`. `repeats_out` must be null or point to a properly
+/// aligned writable `usize`. Invalid size configurations return zero; this
+/// function does not panic for valid pointers.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mothcdc_next_chunk(
     data: *const u8,
@@ -36,7 +38,13 @@ pub unsafe extern "C" fn mothcdc_next_chunk(
     if !repeats_out.is_null() {
         unsafe { *repeats_out = 0 };
     }
-    if data.is_null() || len == 0 || min_size > max_size || max_size == 0 {
+    if data.is_null()
+        || len == 0
+        || min_size > max_size
+        || max_size == 0
+        || max_size > MAX_CHUNK_SIZE
+        || (eof == 0 && len <= max_size)
+    {
         return 0;
     }
     let bytes = unsafe { core::slice::from_raw_parts(data, len) };
@@ -117,5 +125,17 @@ mod tests {
             got, want,
             "C API stream protocol diverged from SliceChunker"
         );
+    }
+
+    #[test]
+    fn capi_rejects_invalid_sizes_without_panicking() {
+        let byte = 0u8;
+        let mut repeats = usize::MAX;
+        let got = unsafe { mothcdc_next_chunk(&byte, 1, 0, usize::MAX, 0, &mut repeats) };
+        assert_eq!(got, 0);
+        assert_eq!(repeats, 0);
+
+        let got = unsafe { mothcdc_next_chunk(&byte, 1, 0, 8, 0, &mut repeats) };
+        assert_eq!(got, 0, "non-EOF input needs max_size + 1 bytes");
     }
 }

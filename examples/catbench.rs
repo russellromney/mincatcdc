@@ -139,7 +139,7 @@ fn main() {
     // plain
     let (secs, _) = best_of(|| {
         let mut n = 0usize;
-        let mut s = 0usize;
+        let mut s = 0u64;
         for b in &blobs {
             for c in SliceChunker::new(b, MIN, MAX, cdc) {
                 s ^= c.offset();
@@ -157,7 +157,7 @@ fn main() {
     {
         let (secs, _) = best_of(|| {
             let mut n = 0usize;
-            let mut s = 0usize;
+            let mut s = 0u64;
             for b in &blobs {
                 for seg in MothChunker::with_cdc(b, MIN, MAX, cdc) {
                     s ^= seg.offset();

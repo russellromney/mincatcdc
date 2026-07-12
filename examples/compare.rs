@@ -40,7 +40,7 @@ struct Stats {
 /// Accumulates (key, stored_len) records and reports unique/dedup over them.
 struct Dedup {
     seen: std::collections::HashMap<u64, usize>,
-    logical: usize,
+    logical: u64,
     records: usize,
 }
 impl Dedup {
@@ -51,7 +51,7 @@ impl Dedup {
             records: 0,
         }
     }
-    fn add(&mut self, key: u64, stored_len: usize, logical_len: usize) {
+    fn add(&mut self, key: u64, stored_len: usize, logical_len: u64) {
         self.seen.entry(key).or_insert(stored_len);
         self.logical += logical_len;
         self.records += 1;
@@ -124,7 +124,7 @@ fn run_fastcdc(data: &[u8], min: usize, avg: usize, max: usize, d: &mut Dedup) -
     });
     for c in FastCDC::new(data, min, avg, max) {
         let b = &data[c.offset..c.offset + c.length];
-        d.add(fnv1a(b), b.len(), b.len());
+        d.add(fnv1a(b), b.len(), b.len() as u64);
     }
     Stats {
         records,
@@ -144,7 +144,7 @@ fn run_mincdc(data: &[u8], min: usize, max: usize, d: &mut Dedup) -> Stats {
         n
     });
     for c in SliceChunker::new(data, min, max, cdc) {
-        d.add(fnv1a(&c), c.len(), c.len());
+        d.add(fnv1a(&c), c.len(), c.len() as u64);
     }
     Stats {
         records,
@@ -206,7 +206,7 @@ fn scenario_versioned(min: usize, avg: usize, max: usize) {
     for data in [&v1[..], &v2[..]] {
         for c in FastCDC::new(data, min, avg, max) {
             let b = &data[c.offset..c.offset + c.length];
-            d.add(fnv1a(b), b.len(), b.len());
+            d.add(fnv1a(b), b.len(), b.len() as u64);
         }
     }
     println!(
@@ -222,7 +222,7 @@ fn scenario_versioned(min: usize, avg: usize, max: usize) {
     let mut d = Dedup::new();
     for data in [&v1[..], &v2[..]] {
         for c in SliceChunker::new(data, min, max, cdc) {
-            d.add(fnv1a(&c), c.len(), c.len());
+            d.add(fnv1a(&c), c.len(), c.len() as u64);
         }
     }
     println!(
