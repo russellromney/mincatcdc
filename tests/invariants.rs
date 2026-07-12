@@ -217,6 +217,18 @@ fn check_all(data: &[u8], min: usize, max: usize, mode: Mode) {
         "slice chunker disagrees with oracle (mode={mode:?}, min={min}, max={max}, len={})",
         data.len()
     );
+
+    // Tier 5: ReadChunker must match SliceChunker, even with a choked reader
+    // that fragments the internal buffer refills. This runs on every corpus and
+    // proptest case so the streaming buffer state machine is fuzzed against the
+    // in-memory chunker, not just checked on a handful of fixed inputs.
+    for &step in &[1usize, 3, 7, 64, 4096] {
+        let read = read_chunks(data, min, max, mode, step);
+        assert_eq!(
+            read, got,
+            "read chunker (step={step}) disagrees with slice chunker (mode={mode:?})"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
