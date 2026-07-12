@@ -22,8 +22,22 @@ information on usage.
 
 ## This fork: mincatcdc
 
-This is a fork of [orlp/mincdc](https://github.com/orlp/mincdc) that adds one
-thing on top: a **caterpillar** layer.
+This is a fork of [orlp/mincdc](https://github.com/orlp/mincdc). MinCDC (the
+algorithm and the SIMD argmin core) is Orson Peters' work; the caterpillar
+idea comes from Chonkers (Berger, 2025); the packed-scanning acceleration
+follows VectorCDC (Udayashankar et al., FAST '25). This fork combines them
+and adds:
+
+- A **caterpillar** layer: runs of byte-identical chunks collapse into single
+  records, and a packed SIMD scan skips the boundary search inside proven
+  runs instead of re-running it per chunk. Streaming runs coalesce across
+  buffer refills, so a multi-GB zero region is one record.
+- A staged extent scan, so the fast path costs nothing (~1%) on data with no
+  runs — including adversarial cases like tars of similar trees.
+- A C API (`--features capi`) and a
+  [dedup-bench fork](https://github.com/russellromney/dedup-bench/tree/mincatcdc-integration)
+  so the crate is measured by the same harness as every other chunker.
+- Measured configuration guidance and a `frontier` sweep tool.
 
 When data has a long run of repeated bytes — zeros, padding, the same block over
 and over — mincdc cuts it into a flood of tiny chunks. Each chunk is a record you
@@ -41,42 +55,72 @@ The caterpillar idea comes from the [Chonkers
 algorithm](https://arxiv.org/abs/2509.11121) (Berger, 2025), which calls a
 periodic run a *caterpillar*.
 
-For head-to-head numbers against other chunkers (FastCDC, AE, RAM, SeqCDC,
-VectorCDC-accelerated variants, …) measured by the *same* harness, this crate
-plugs into [UWASL dedup-bench](https://github.com/UWASL/dedup-bench) via a C
-API: see the
-[mincatcdc-integration fork](https://github.com/russellromney/dedup-bench/tree/mincatcdc-integration)
-(`chunking_algo=mincdc`, built against `cargo build --release --features capi`).
-The corpus used for the numbers in `CHANGELOG.md` is public — VM images plus a
-sha256 manifest at
-`https://mincatcdc-bench-corpus.t3.storage.dev/corpus/MANIFEST.sha256` — so
-the comparison is reproducible end to end.
+### Measured against the field
 
-On speed, the caterpillar is free on data with no runs (within ~2%) and much
-*faster* than plain mincdc on redundant data: a packed SIMD scan (in the spirit
-of VectorCDC, FAST '25) proves a run periodic once and emits the repeated
-chunks without re-running the boundary search. On a raw Debian VM image that is
-2.6–3.8x plain mincdc (13.0 GiB/s on AMD EPYC/AVX2, 11.2 GiB/s on Apple
-M-series/NEON); on a mostly-empty disk image ~17x; on compressed or run-free
-data (`.ova` appliances, SQLite, logs) it changes nothing. Zero-fill is the
-ceiling: ~30x (74 GiB/s on AVX-512). See `CHANGELOG.md` for the full tables and
-`benches/throughput.rs` (`cargo bench`, no RUSTFLAGS needed — SIMD width is
-runtime-detected; `BENCH_CORPUS=<dir>` benches your own files). And mincdc is
-already several times faster than FastCDC.
+All numbers below come from [UWASL dedup-bench](https://github.com/UWASL/dedup-bench)
+(the VectorCDC evaluation harness), with mincatcdc plugged in as a chunking
+technique — same loop, same timers, same dedup measurement as every other
+algorithm. One machine (Fly performance-8x, AMD EPYC/AVX2), one session,
+~8 KiB target chunks. Corpora: a raw Debian VM image (768 MiB), DEB `.ova`
+appliances (3 GiB, from the FAST '25 dataset), LNX backup generations (six
+consecutive linux-6.6.x source tars, 8 GiB), and enwik9 (1 GiB of Wikipedia
+text, held out of all tuning).
 
-The output: metadata-efficient CDC
-on redundant data without writing any domain-specific preprocessing (zero
-detection, sparse reads, etc.). See `examples/CATBENCH_RESULTS.md` and
-`examples/REALBENCH_RESULTS.md` for measurements on real corpora.
+Throughput, GiB/s. `narrow` is mincatcdc at `(min=4096, max=12288)`:
+
+| algorithm | raw VM | DEB .ova | LNX | enwik9 |
+|---|---|---|---|---|
+| AE-Min / FastCDC / RAM | 1.4 / 1.8 / 1.5 | 1.4 / 2.0 / 1.4 | 1.4 / 1.9 / 1.6 | 1.4 / 1.9 / 1.9 |
+| SeqCDC | 3.2 | 6.4 | 7.1 | 5.9 |
+| VectorCDC AE-Min (AVX2) | 14.0 | 5.4 | 7.9 | 8.5 |
+| mincatcdc (default) | 11.4 | 10.7 | 9.3 | 8.0 |
+| **mincatcdc (narrow)** | **16.2** | **15.2** | **14.0** | **13.1** |
+| VectorCDC RAM (AVX2) | 23.4 | 19.6 | 24.7 | 29.6 |
+
+Space savings (dedup-bench `measure-dedup`, deterministic):
+
+| algorithm | raw VM | DEB .ova | LNX |
+|---|---|---|---|
+| **mincatcdc (narrow)** | **53.3%** | **5.2%** | **60.3%** |
+| mincatcdc (default) | 53.2% | 4.9% | 59.2% |
+| SeqCDC | 52.4% | 4.0% | 56.5% |
+| FastCDC | 51.8% | 4.8% | 52.4% |
+| AE-Min | 50.0% | 3.5% | 55.5% |
+| RAM / VectorCDC RAM | 51.4% | 3.2% | 49.2% |
+
+The shape of the result: **best dedup ratio on every corpus, at every chunk
+size tested (4K/8K/16K), and the fastest content-defined chunker except
+VectorCDC RAM** — which buys its speed with the worst dedup in the field.
+Metadata: on the run-heavy VM image the caterpillar collapses 232k chunks
+into 56k records, fewer than any other algorithm's plain chunk count except
+FastCDC's (which runs 2x over its chunk-size target there). On run-free data
+records equal chunks and the layer costs ~1%.
+
+Caveats we know about: chunk-size normalization would trim some of the dedup
+edge over AE-Min (mincdc runs slightly under target where others run over);
+SeqCDC ties plain mincdc's dedup at 16K targets; the held-out enwik9 confirms
+the speed generalizes but is useless for dedup comparison (a single text file
+has ~0% duplication for every algorithm); and absolute GiB/s varies across
+shared hosts — compare within a column, not across tables from different
+machines.
+
+Reproduce it: the corpus is public
+(`https://mincatcdc-bench-corpus.t3.storage.dev/corpus/MANIFEST.sha256`,
+sha256 manifest included), the harness fork is linked above, and
+`BENCH_CORPUS=<dir> cargo bench` runs the in-repo criterion suite on your own
+files. No RUSTFLAGS needed anywhere — SIMD width is runtime-detected
+(SSE2/AVX2/AVX-512BW on x86_64, NEON on aarch64). Older per-corpus tables live
+in `CHANGELOG.md`, `examples/CATBENCH_RESULTS.md`, and
+`examples/REALBENCH_RESULTS.md`.
 
 ### Choosing min/max
 
 For a target average chunk size, prefer a **narrow window with a high
-minimum**: at the same ~8 KiB average, `(min=4096, max=12288)` chunks ~25%
-faster than `(2048, 14336)` with equal-or-better dedup on real VM-image
-corpora, because the boundary search scans `max - min` bytes per chunk (8 KiB
-instead of 12 KiB). Widening `max` buys fewer metadata records but costs both
-speed and dedup. Measure on your own data with
+minimum**: at the same ~8 KiB average, `(min=4096, max=12288)` chunks 40–50%
+faster than `(2048, 14336)` with equal-or-better dedup on every corpus we
+measured, because the boundary search scans `max - min` bytes per chunk
+(8 KiB instead of 12 KiB). Widening `max` buys fewer metadata records but
+costs both speed and dedup. Measure on your own data with
 `cargo run --release --example frontier -- <paths>`, which prints the
 throughput / dedup / records trade-off for a grid of configurations. (The
 hash multiplier/addend choice measurably does not matter; keep the defaults.)
@@ -101,8 +145,11 @@ for seg in CaterpillarChunker::new(&data, 2048, 14336, MinCdcHash4::new()) {
 
 `CaterpillarChunker` works on an in-memory slice; for inputs larger than memory,
 `CaterpillarReadChunker` does the same coalescing over a streaming reader in
-bounded memory — zero-copy (it yields borrowed `Segment`s valid until the next
-call, like `ReadChunker`).
+bounded memory (it yields borrowed `Segment`s valid until the next call, like
+`ReadChunker`). Runs coalesce across buffer refills: a run's unit is copied
+once — at most `max_size` bytes — when it crosses a refill, so even a
+multi-gigabyte zero region is a single record. Everything else stays
+zero-copy.
 
 (An experimental second tier — content-defined *period detection* for
 phase-rotating runs — was evaluated and removed: mincdc self-aligns to most
