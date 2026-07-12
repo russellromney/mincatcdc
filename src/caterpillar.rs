@@ -873,6 +873,54 @@ mod tests {
         );
     }
 
+    struct ReadOnceThenEof {
+        data: Vec<u8>,
+        sent: bool,
+    }
+
+    impl std::io::Read for ReadOnceThenEof {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.sent {
+                return Ok(0);
+            }
+            assert!(buf.len() >= self.data.len());
+            buf[..self.data.len()].copy_from_slice(&self.data);
+            self.sent = true;
+            Ok(self.data.len())
+        }
+    }
+
+    #[test]
+    fn streaming_emits_carried_runs_when_the_next_read_is_eof() {
+        let cases = [
+            // Four identical chunks consume the entire first read, so EOF is
+            // discovered with a repeated run still in carry_run.
+            vec![0xA5; 64],
+            // The first full chunk is carried while the short, differing tail
+            // remains undecidable; EOF then terminates that singleton run.
+            [vec![0x11; 16], vec![0x22; 8]].concat(),
+        ];
+
+        for data in cases {
+            let want: Vec<_> = MothChunker::new(&data, 16, 16)
+                .map(|s| (s.offset(), s.len(), s.chunk_count(), s.dedup_key().to_vec()))
+                .collect();
+            let reader = ReadOnceThenEof { data, sent: false };
+            let mut chunker = MothReadChunker::new(reader, 16, 16);
+            let mut got = Vec::new();
+            while let Some(segment) = chunker.next().unwrap() {
+                got.push((
+                    segment.offset(),
+                    segment.len(),
+                    segment.chunk_count(),
+                    segment.dedup_key().to_vec(),
+                ));
+            }
+            assert_eq!(got, want);
+            assert!(chunker.next().unwrap().is_none());
+        }
+    }
+
     #[test]
     fn self_aligns_and_collapses_periodic_data() {
         // mincdc self-aligns boundaries to periods when a period multiple fits in

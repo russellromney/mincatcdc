@@ -679,6 +679,73 @@ mod test {
         assert_eq!(got, want);
     }
 
+    #[test]
+    fn read_chunker_compacts_its_buffer_without_changing_boundaries() {
+        let n = crate::MIN_BUFFER_SIZE + 16 * 1024;
+        let data: Vec<u8> = (0..n)
+            .map(|i| {
+                let x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                (x ^ (x >> 29)) as u8
+            })
+            .collect();
+        let want: Vec<_> = SliceChunker::new(&data, 64, 256, MinCdcHash4::new())
+            .map(|c| (c.offset(), c.to_vec()))
+            .collect();
+
+        let mut chunker = ReadChunker::new(Cursor::new(&data), 64, 256, MinCdcHash4::new());
+        let mut got = Vec::new();
+        while let Some(chunk) = chunker.next().unwrap() {
+            got.push((chunk.offset(), chunk.to_vec()));
+        }
+        assert_eq!(got, want);
+        assert!(chunker.next().unwrap().is_none());
+    }
+
+    struct PartialThenError {
+        data: Vec<u8>,
+        offset: usize,
+        state: u8,
+    }
+
+    impl Read for PartialThenError {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.state == 1 {
+                self.state = 2;
+                return Err(io::Error::other("transient reader failure"));
+            }
+            if self.offset == self.data.len() {
+                return Ok(0);
+            }
+            let limit = if self.state == 0 { 17 } else { buf.len() };
+            let n = limit.min(buf.len()).min(self.data.len() - self.offset);
+            buf[..n].copy_from_slice(&self.data[self.offset..self.offset + n]);
+            self.offset += n;
+            self.state = 1.max(self.state);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn read_chunker_resumes_after_error_with_internal_progress() {
+        let data: Vec<u8> = (0..8192).map(|i| (i * 31) as u8).collect();
+        let want: Vec<_> = SliceChunker::new(&data, 64, 256, MinCdcHash4::new())
+            .map(|c| (c.offset(), c.to_vec()))
+            .collect();
+        let reader = PartialThenError {
+            data,
+            offset: 0,
+            state: 0,
+        };
+        let mut chunker = ReadChunker::new(reader, 64, 256, MinCdcHash4::new());
+
+        assert_eq!(chunker.next().unwrap_err().kind(), io::ErrorKind::Other);
+        let mut got = Vec::new();
+        while let Some(chunk) = chunker.next().unwrap() {
+            got.push((chunk.offset(), chunk.to_vec()));
+        }
+        assert_eq!(got, want);
+    }
+
     struct ErrorAfterFirstRead {
         data: Vec<u8>,
         first: bool,

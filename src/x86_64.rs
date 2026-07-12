@@ -287,14 +287,23 @@ pub fn argmin_u32_overlapping_hashed<const SHOULD_HASH: bool>(
     multiplier: u32,
     addend: u32,
 ) -> usize {
-    assert!(bytes.len() <= u32::MAX as usize);
-
-    let within_four_offset = if SHOULD_HASH {
-        unsafe { ARGMIN_HASH_IMPL(bytes, multiplier, addend) }
+    let implementation = if SHOULD_HASH {
+        *ARGMIN_HASH_IMPL
     } else {
-        unsafe { ARGMIN_IMPL(bytes, multiplier, addend) }
+        *ARGMIN_IMPL
     };
+    argmin_with_impl::<SHOULD_HASH>(bytes, multiplier, addend, implementation)
+}
 
+#[inline(always)]
+fn argmin_with_impl<const SHOULD_HASH: bool>(
+    bytes: &[u8],
+    multiplier: u32,
+    addend: u32,
+    implementation: ArgMinFn,
+) -> usize {
+    assert!(bytes.len() <= u32::MAX as usize);
+    let within_four_offset = unsafe { implementation(bytes, multiplier, addend) };
     refine_argmin::<SHOULD_HASH>(bytes, within_four_offset, multiplier, addend)
 }
 
@@ -582,10 +591,20 @@ mod tests {
     fn scalar_dispatch_result_at_tail_needs_no_refinement() {
         let mut bytes = vec![0xFF; 19];
         bytes[15..].fill(0);
-        let exact = scalar::argmin_u32_overlapping_hashed::<false>(&bytes, 1, 0);
-        assert_eq!(exact, 15);
 
-        let got = refine_argmin::<false>(&bytes, exact, 1, 0);
+        let got =
+            argmin_with_impl::<false>(&bytes, 1, 0, scalar::argmin_u32_overlapping_hashed::<false>);
+        assert_eq!(got, 15);
+
+        let multiplier = 0x9E37_79B1;
+        let addend = 0x85EB_CA77;
+        let exact = scalar::argmin_u32_overlapping_hashed::<true>(&bytes, multiplier, addend);
+        let got = argmin_with_impl::<true>(
+            &bytes,
+            multiplier,
+            addend,
+            scalar::argmin_u32_overlapping_hashed::<true>,
+        );
         assert_eq!(got, exact);
     }
 
