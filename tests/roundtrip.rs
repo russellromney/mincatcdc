@@ -181,6 +181,74 @@ fn streaming_grouping_is_independent_of_read_fragmentation() {
     assert!(cursor[0].2 >= 2);
 }
 
+/// The in-memory slice caterpillar's grouping: (offset, len, count, dedup_key).
+fn slice_grouping(data: &[u8], min: usize, max: usize) -> Vec<(u64, u64, u64, Vec<u8>)> {
+    MothChunker::new(data, min, max)
+        .map(|s| (s.offset(), s.len(), s.chunk_count(), s.dedup_key().to_vec()))
+        .collect()
+}
+
+/// The streaming caterpillar must produce *exactly* the slice caterpillar's
+/// segment grouping — same offsets, lengths, counts, and unit bytes — for every
+/// corpus and every reader fragmentation. This is the strong form of the
+/// "grouping is independent of `Read` fragmentation" claim: not merely that two
+/// readers agree with each other, but that the stream matches the in-memory
+/// reference, so a coalesced run is never split or merged differently by a
+/// hostile reader. Guards the singleton-carry logic in `MothReadChunker::next`.
+#[test]
+fn streaming_grouping_matches_slice_across_fragmentations() {
+    let configs = [(64usize, 256usize), (2048, 14336), (2048, 2200), (16, 16)];
+    let steps = [1usize, 2, 3, 7, 13, 64, 4096, 100_000];
+    for (name, data) in corpora() {
+        for &(min, max) in &configs {
+            let want = slice_grouping(&data, min, max);
+            for &step in &steps {
+                let got = segment_layout(
+                    ChokedReader {
+                        data: &data,
+                        pos: 0,
+                        step,
+                    },
+                    min,
+                    max,
+                );
+                assert_eq!(
+                    got,
+                    want,
+                    "{name} (min={min} max={max} step={step}): streaming grouping \
+                     diverges from slice caterpillar ({} vs {} records)",
+                    got.len(),
+                    want.len()
+                );
+            }
+        }
+    }
+}
+
+/// A single run longer than the internal buffer must coalesce to the same
+/// grouping as the slice caterpillar regardless of how the reader fragments the
+/// refills that the run crosses.
+#[test]
+fn streaming_run_crossing_buffer_matches_slice() {
+    let mut data = xorshift(1, 100 * 1024);
+    data.extend_from_slice(&vec![0u8; 10 * 1024 * 1024]);
+    data.extend_from_slice(&xorshift(2, 100 * 1024));
+    let (min, max) = (2048usize, 14336usize);
+    let want = slice_grouping(&data, min, max);
+    for &step in &[1usize, 4096, 1_000_000, 5_000_000] {
+        let got = segment_layout(
+            ChokedReader {
+                data: &data,
+                pos: 0,
+                step,
+            },
+            min,
+            max,
+        );
+        assert_eq!(got, want, "large-run grouping diverges at step={step}");
+    }
+}
+
 struct InterruptOnce<R> {
     inner: R,
     interrupted: bool,
