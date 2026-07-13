@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.2 — documentation refresh (2026-07-12)
+
+- Rewrites the README in plainer language while preserving the exact API,
+  benchmark settings, results, and caveats.
+- Adds clearer benchmark dataset labels and explains whether higher or lower
+  values are better in each table.
+- Clarifies the caterpillar behavior, streaming API, configuration guidance,
+  MinCDC algorithm, and original upstream benchmark.
+- Simplifies the crate description shown on crates.io.
+
+This release contains no code changes.
+
 ## 0.7.1 — API unification and release hardening (2026-07-12)
 
 Unifies the public API around the caterpillar layer as the recommended
