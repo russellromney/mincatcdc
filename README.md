@@ -56,7 +56,8 @@ cargo rustc --release --features capi --lib -- --crate-type staticlib
 All numbers come from [UWASL dedup-bench](https://github.com/UWASL/dedup-bench)
 (the VectorCDC evaluation harness), with MothCDC plugged in as a chunking
 technique — same loop, same timers, same dedup measurement as every other
-algorithm. One AMD EPYC/AVX2 machine, one session, ~8 KiB target chunks.
+algorithm. Runs use a Fly performance-8x machine (AMD EPYC/AVX2, 8 vCPUs,
+16 GiB RAM) with ~8 KiB target chunks.
 Corpora: a raw Debian VM image (768 MiB), DEB `.ova` appliances (3 GiB, FAST
 '25 dataset), six consecutive linux-6.6.x source tars (8 GiB, stand-ins for
 backup generations), and enwik9 (1 GiB of Wikipedia text, never used for
@@ -85,11 +86,28 @@ Space savings (dedup-bench `measure-dedup`; same result on any machine):
 | AE-Min | 50.0% | 3.5% | 55.5% |
 | RAM / VectorCDC RAM | 51.4% | 3.2% | 49.2% |
 
+Metadata rows (same harness and corpora). Conventional chunkers emit one row
+per chunk; MothCDC counts maximal per-file runs of adjacent byte-identical
+chunks as one row while retaining every underlying chunk hash for the dedup
+measurement. Accelerated variants have the same boundaries and row counts as
+their scalar counterparts.
+
+| algorithm | raw VM | DEB .ova | LNX | enwik9 |
+|---|---:|---:|---:|---:|
+| AE-Min / VectorCDC AE-Min | 97,296 | 356,419 | 938,534 | 117,956 |
+| FastCDC | **48,657** | **328,137** | 793,428 | 96,342 |
+| RAM / VectorCDC RAM | 77,413 | 360,523 | **721,404** | **50,972** |
+| SeqCDC | 71,267 | 345,820 | 1,368,420 | 133,535 |
+| MinCDC / MothCDC plain (wide) | 231,777 | 343,821 | 1,186,018 | 163,214 |
+| MothCDC (wide) | 56,536 | 343,775 | 1,185,991 | 163,197 |
+| **MothCDC** | 56,175 | 363,796 | 1,113,467 | 138,532 |
+
 In short: **best dedup on every corpus at every chunk size tested (4K, 8K,
 16K), and the fastest chunker except VectorCDC RAM** — which has the worst
-dedup of any algorithm here. On the VM image (long zero runs) the caterpillar
-turns 232k chunks into 56k records; on data without runs, records equal
-chunks and the layer costs ~1%.
+dedup of any algorithm here. On the VM image (long zero runs), the wide
+caterpillar turns 231,777 chunks into 56,536 rows (-75.6%); the recommended
+window turns 143,765 chunks into 56,175 rows (-60.9%). On data without long
+identical runs, metadata is effectively unchanged and the layer costs ~1%.
 
 Caveats. mincdc runs slightly under the chunk-size target where others run
 over, so normalizing for chunk size would trim some of the dedup edge over
